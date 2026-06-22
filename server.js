@@ -91,8 +91,8 @@ app.use('/api/', apiLimiter); // baseline floor across all API routes
 
 // ─── Static Files ─────────────────────────────────────────────────────────────
 app.use(express.static(path.join(__dirname)));
-app.get('/',     (_,res) => res.sendFile(path.join(__dirname, 'design_den_complete.html')));
-app.get('/store',(_,res) => res.sendFile(path.join(__dirname, 'design_den_complete.html')));
+app.get('/',     (_,res) => res.sendFile(path.join(__dirname, 'index.html')));
+app.get('/store',(_,res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.get('/admin',(_,res) => res.sendFile(path.join(__dirname, 'admin.html')));
 
 // ─── MongoDB ──────────────────────────────────────────────────────────────────
