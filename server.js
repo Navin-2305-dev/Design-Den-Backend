@@ -11,7 +11,6 @@ const cors        = require('cors');
 const Razorpay    = require('razorpay');
 const crypto      = require('crypto');
 const nodemailer  = require('nodemailer');
-const path        = require('path');
 const helmet      = require('helmet');             // NEW — security headers (npm i helmet)
 const rateLimit   = require('express-rate-limit');  // NEW — brute-force protection (npm i express-rate-limit)
 
@@ -31,34 +30,54 @@ app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy:false, crossOriginEmbedderPolicy:false }));
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
-// CORS Configuration for Vercel Frontend
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
+// CORS: the production frontend domain is hardcoded below as a safe default —
+// this is what actually fixes "CORS error" on the live site. ALLOWED_ORIGINS
+// (optional, comma-separated) lets you ADD more domains (a custom domain,
+// a staging URL, etc.) without removing this default or needing to redeploy
+// just to get back to a working state.
+const DEFAULT_ALLOWED_ORIGINS = [
+    'https://design-den-studio.vercel.app',  // production frontend (Vercel)
+];
+const EXTRA_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
+// FIXED: STORE_URL previously fell back to 'http://localhost:5000' — meaning
+// every email (order confirmation, commission updates, pattern delivery)
+// would link customers to a localhost address if this env var were ever
+// unset on Render. Falls back to the real production frontend instead.
+const STORE_URL = (process.env.STORE_URL || 'https://design-den-studio.vercel.app').replace(/\/+$/, '');
+// Normalize away trailing slashes — "https://x.vercel.app/" and
+// "https://x.vercel.app" are the same origin to a browser but NOT the same
+// string, and a same-string check is exactly what was silently breaking this
+// before. This single normalization is the actual fix for that class of bug.
+const stripTrailingSlash = (s) => s.replace(/\/+$/, '');
+const ALLOWED_ORIGINS = [...new Set([...DEFAULT_ALLOWED_ORIGINS, ...EXTRA_ALLOWED_ORIGINS].map(stripTrailingSlash))];
 
-// CORS configuration with proper origin handling
-const corsOptions = {
-    origin: function (origin, callback) {
-        // Allow requests with no origin (like mobile apps, Postman, or curl)
+app.use(cors({
+    origin: (origin, callback) => {
+        // No Origin header at all (curl, server-to-server, same-origin requests,
+        // Razorpay webhooks) — always allow; there's no browser CORS check to fail.
         if (!origin) return callback(null, true);
-        
-        // If ALLOWED_ORIGINS is set, check against the list
-        if (ALLOWED_ORIGINS.length > 0) {
-            if (ALLOWED_ORIGINS.indexOf(origin) !== -1) {
-                callback(null, true);
-            } else {
-                callback(new Error('Not allowed by CORS'));
-            }
-        } else {
-            // Fallback: allow all origins if ALLOWED_ORIGINS is not set
-            callback(null, true);
-        }
+        // NEW: browsers send the literal string "null" as the Origin header for
+        // file:// pages (e.g. opening admin.html by double-clicking it instead of
+        // serving it from a dev server). This is a real, distinct value — not the
+        // same as no header at all — and needs its own explicit check. Allowed
+        // here since it only ever happens when testing locally from disk.
+        if (origin === 'null') return callback(null, true);
+        // Always allow ANY localhost/127.0.0.1 port for local development —
+        // covers Vite, CRA, Live Server, or anything else regardless of port,
+        // without needing to list every possible dev server port individually.
+        if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
+        if (ALLOWED_ORIGINS.includes(stripTrailingSlash(origin))) return callback(null, true);
+        // NEW: log rejected origins so a future mismatch shows up in Render's
+        // logs immediately instead of being a CORS error only visible in the
+        // browser console (where it's much harder to notice/diagnose remotely).
+        console.warn(`⚠️  CORS rejected request from origin: ${origin}`);
+        callback(new Error('Not allowed by CORS'));
     },
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Key'],
-    credentials: true, // Changed to true to support cookies/auth headers
-    optionsSuccessStatus: 200
-};
-
-app.use(cors(corsOptions));
+    methods:['GET','POST','PUT','DELETE','PATCH','OPTIONS'],
+    allowedHeaders:['Content-Type','Authorization','X-Admin-Key'],
+    credentials:false,
+    optionsSuccessStatus:200
+}));
 app.use(express.json({ limit:'10mb' }));
 app.use((req,_,next)=>{ console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.path}`); next(); });
 
@@ -89,12 +108,20 @@ const apiLimiter = rateLimit({
 });
 app.use('/api/', apiLimiter); // baseline floor across all API routes
 
-// ─── Health Check Route ───────────────────────────────────────────────────────
-// Frontend is hosted separately on Vercel/Netlify
+// ─── Root / health check ──────────────────────────────────────────────────────
+// CHANGED: this backend is API-only — the frontend (design_den_complete.html)
+// and admin panel (admin.html) are deployed separately on Vercel, not served
+// from here. Previously this repo's server.js also tried to serve those HTML
+// files directly via express.static + sendFile, using paths that pointed at
+// the PARENT directory (path.join(__dirname, '..')) — that only works if the
+// HTML files happen to sit one level up from server.js on whatever host runs
+// it, which is a fragile assumption and breaks the moment the deploy layout
+// differs. Since the real frontend is a separate Vercel deployment anyway,
+// none of that serving logic is needed — this route is just a status check.
 app.get('/', (_,res) => res.json({
     status: 'ok',
     message: 'Design Den API Server',
-    frontend: process.env.FRONTEND_URL || 'Not configured'
+    frontend: STORE_URL // single source of truth — same value used for email links, no separate FRONTEND_URL env var to keep in sync
 }));
 
 // ─── MongoDB ──────────────────────────────────────────────────────────────────
@@ -106,12 +133,34 @@ mongoose.connect(process.env.MONGO_URI, { dbName:'design_den' })
 //  SCHEMAS & MODELS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// NEW: product variants (e.g. color, weight). Design notes:
+// - A product with an EMPTY variants array behaves exactly as before — top-level
+//   price/stock are authoritative. This keeps every existing product, cart item,
+//   and order record working unchanged.
+// - When variants ARE present, each variant carries its OWN price and stock.
+//   The top-level price/stock on the product become a "starting from" display
+//   value only (e.g. lowest variant price) — see the pre-save hook below.
+// - Each variant gets a stable `variantId` (not Mongo's _id, to keep cart/order
+//   JSON simple and avoid ObjectId-in-frontend headaches) so cart items can
+//   reference "this exact variant of this exact product."
+const variantSchema = new mongoose.Schema({
+    variantId: { type:String, required:true },              // e.g. "red-100g", stable, set once
+    label:     { type:String, required:true, trim:true },   // e.g. "Sunset Red"
+    type:      { type:String, default:'option', enum:['color','weight','option'] },
+    swatch:    { type:String, default:'' },                 // hex color or small image URL for color swatches
+    img:       { type:String, default:'' },                 // optional variant-specific photo (falls back to product img)
+    price:     { type:Number, required:true, min:0 },
+    stock:     { type:Number, required:true, default:0, min:0 },
+    sku:       { type:String, default:'' },
+    active:    { type:Boolean, default:true }                // lets you retire one variant without deleting the product
+}, { _id:false });
+
 const productSchema = new mongoose.Schema({
     name:          { type:String, required:true, trim:true },
-    price:         { type:Number, required:true, min:0 },
+    price:         { type:Number, required:true, min:0 }, // base/display price — see variants note above
     originalPrice: { type:Number, default:null },
     category:      { type:String, required:true, enum:['yarn','kit','hook','bundle'] },
-    stock:         { type:Number, required:true, default:0, min:0 },
+    stock:         { type:Number, required:true, default:0, min:0 }, // ignored once variants exist — see note above
     rating:        { type:Number, default:4.8, min:1, max:5 },
     reviewCount:   { type:Number, default:0 },
     img:           { type:String, default:'' },
@@ -125,11 +174,46 @@ const productSchema = new mongoose.Schema({
     sku:           { type:String, default:'' },
     weight:        { type:String, default:'' },
     material:      { type:String, default:'' },
+    variants:      { type:[variantSchema], default:[] }, // NEW
     createdAt:     { type:Date, default:Date.now },
     updatedAt:     { type:Date, default:Date.now }
 });
 productSchema.index({ category:1, active:1 });
 productSchema.index({ name:'text', desc:'text', tags:'text' });
+
+// NEW: keep top-level price/stock in sync as a display/back-compat convenience
+// whenever variants are present — price becomes "lowest variant price" (what
+// you'd show on a product grid card before the customer picks a variant), and
+// stock becomes the sum across active variants (so existing low-stock/out-of-
+// stock UI logic that reads p.stock keeps working without changes).
+productSchema.pre('save', function(next) {
+    if (this.variants && this.variants.length) {
+        const activeVariants = this.variants.filter(v => v.active);
+        if (activeVariants.length) {
+            this.price = Math.min(...activeVariants.map(v => v.price));
+            this.stock = activeVariants.reduce((sum, v) => sum + v.stock, 0);
+        } else {
+            this.stock = 0; // all variants deactivated
+        }
+    }
+    next();
+});
+
+// NEW: saved addresses (multiple, labeled). Kept separate from the legacy
+// `address` field above (Mixed, single) to avoid touching existing data —
+// any old single address stays exactly where it was; this is purely additive.
+const savedAddressSchema = new mongoose.Schema({
+    addressId: { type:String, required:true },
+    label:     { type:String, default:'Home' }, // e.g. "Home", "Work"
+    name:      { type:String, required:true, trim:true },
+    phone:     { type:String, required:true, trim:true },
+    line1:     { type:String, required:true, trim:true },
+    line2:     { type:String, default:'', trim:true },
+    city:      { type:String, required:true, trim:true },
+    state:     { type:String, required:true, trim:true },
+    pin:       { type:String, required:true, trim:true },
+    isDefault: { type:Boolean, default:false }
+}, { _id:false });
 
 const userSchema = new mongoose.Schema({
     name:       { type:String, required:true, trim:true, maxlength:80 },
@@ -138,6 +222,7 @@ const userSchema = new mongoose.Schema({
     password:   { type:String, required:true },
     city:       { type:String, default:'' },
     address:    { type:mongoose.Schema.Types.Mixed, default:{} },
+    savedAddresses: { type:[savedAddressSchema], default:[] }, // NEW
     totalSpent: { type:Number, default:0 },
     orderCount: { type:Number, default:0 },
     createdAt:  { type:Date, default:Date.now }
@@ -157,7 +242,14 @@ const wishlistSchema = new mongoose.Schema({
 });
 
 const orderSchema = new mongoose.Schema({
-    userId:      { type:mongoose.Schema.Types.ObjectId, ref:'User', required:true },
+    // NEW: userId is now optional — guest checkout orders have no account behind
+    // them. guestEmail/guestPhone are required instead when there's no userId
+    // (enforced in the route, not here, since Mongoose conditional-required
+    // across two paths gets awkward — the route is the single source of truth).
+    userId:      { type:mongoose.Schema.Types.ObjectId, ref:'User', default:null },
+    guestEmail:  { type:String, default:'', lowercase:true, trim:true },
+    guestPhone:  { type:String, default:'', trim:true },
+    isGuestOrder:{ type:Boolean, default:false },
     id:          { type:String, required:true, unique:true }, // Format: DD-XXXXXXXXXX
     items:       { type:mongoose.Schema.Types.Mixed, required:true },
     total:       { type:Number, required:true },
@@ -173,6 +265,7 @@ const orderSchema = new mongoose.Schema({
     createdAt:   { type:Date, default:Date.now }
 });
 orderSchema.index({ userId:1, createdAt:-1 });
+orderSchema.index({ guestEmail:1, createdAt:-1 }); // NEW — lets guests look up their orders by email
 orderSchema.index({ status:1 });
 orderSchema.index({ id:1 });
 
@@ -353,7 +446,7 @@ function welcomeEmail(name) {
     </div>
 
     <div style="text-align:center;margin-bottom:32px;">
-      <a href="${process.env.STORE_URL||'http://localhost:5000'}" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:15px 40px;border-radius:999px;font-weight:800;font-size:0.82rem;letter-spacing:2px;text-transform:uppercase;box-shadow:0 8px 24px rgba(139,50,82,0.25);">START SHOPPING ✦</a>
+      <a href="${STORE_URL}" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:15px 40px;border-radius:999px;font-weight:800;font-size:0.82rem;letter-spacing:2px;text-transform:uppercase;box-shadow:0 8px 24px rgba(139,50,82,0.25);">START SHOPPING ✦</a>
     </div>
 
     <div style="display:flex;gap:0;border-top:1px solid rgba(212,116,140,0.15);padding-top:24px;margin-top:4px;">
@@ -391,6 +484,23 @@ function auth(req, res, next) {
         if (payload.isAdmin) return res.status(403).json({ message:'Use user token' });
         req.user = payload; next();
     } catch { res.status(401).json({ message:'Invalid or expired token' }); }
+}
+
+// NEW: optional auth for guest-checkout-capable routes. If a valid user token
+// is present, req.user is set (same as `auth`) and the route can treat the
+// request as a logged-in order. If no token (or an invalid one) is present,
+// req.user stays undefined and the route proceeds as a guest checkout instead
+// of rejecting outright. Admin tokens are still rejected here — admins place
+// orders through the storefront the same as anyone, never "as admin."
+function optionalAuth(req, res, next) {
+    const h = req.headers.authorization;
+    if (!h || !h.startsWith('Bearer ')) { req.user = null; return next(); }
+    try {
+        const payload = jwt.verify(h.slice(7), process.env.JWT_SECRET);
+        if (payload.isAdmin) return res.status(403).json({ message:'Use user token' });
+        req.user = payload;
+    } catch { req.user = null; } // invalid/expired token — fall through as guest rather than blocking
+    next();
 }
 
 function adminAuth(req, res, next) {
@@ -477,12 +587,26 @@ app.get('/api/health', (_,res) => res.json({ status:'ok', ts:Date.now() }));
 // Products
 app.get('/api/products', async (req, res) => {
     try {
-        const { category, search, badge, featured, sort } = req.query;
+        const { category, search, badge, featured, sort, minPrice, maxPrice, material, inStock } = req.query;
         const q = { active:true };
         if (category && category !== 'all') q.category = category;
         if (badge)    q.badge = badge;
         if (featured) q.featured = true;
         if (search) { const re = new RegExp(search.trim(),'i'); q.$or = [{ name:re },{ desc:re },{ tags:re }]; }
+        // NEW: price range filter — operates on the (possibly variant-derived) top-level price
+        if (minPrice || maxPrice) {
+            q.price = {};
+            if (minPrice) q.price.$gte = parseFloat(minPrice);
+            if (maxPrice) q.price.$lte = parseFloat(maxPrice);
+        }
+        // NEW: material filter (cotton, wool, bamboo, etc) — comma-separated for multi-select
+        if (material) {
+            const materials = String(material).split(',').map(m=>m.trim()).filter(Boolean);
+            if (materials.length) q.material = { $in: materials.map(m => new RegExp(`^${m}$`,'i')) };
+        }
+        // NEW: in-stock-only toggle
+        if (inStock === 'true') q.stock = { $gt: 0 };
+
         let query = Product.find(q).select('-__v');
         if (sort === 'price_asc')       query = query.sort({ price:1 });
         else if (sort === 'price_desc') query = query.sort({ price:-1 });
@@ -490,6 +614,18 @@ app.get('/api/products', async (req, res) => {
         else query = query.sort({ createdAt:-1 });
         res.json({ products: await query });
     } catch(err) { console.error('[GET /products]',err); res.status(500).json({ message:'Failed to fetch products' }); }
+});
+// NEW: distinct materials across active products, for populating the material
+// filter checkboxes dynamically instead of hardcoding a list in the frontend.
+// IMPORTANT: this must be registered BEFORE /api/products/:id below — Express
+// matches routes in registration order, so /api/products/:id would otherwise
+// intercept this request first, treating "materials" as a product ID and
+// returning 404 (this exact bug existed here until caught by testing).
+app.get('/api/products/materials', async (_,res) => {
+    try {
+        const materials = await Product.distinct('material', { active:true, material:{ $ne:'' } });
+        res.json({ materials: materials.sort() });
+    } catch { res.status(500).json({ message:'Failed to fetch materials' }); }
 });
 app.get('/api/products/:id', async (req, res) => {
     try {
@@ -726,6 +862,92 @@ app.get('/api/user/commissions', auth, async (req,res) => {
     } catch { res.status(500).json({ message:'Error' }); }
 });
 
+// ── Saved addresses ───────────────────────────────────────────────────────────
+// NEW: lets returning customers save 2-3 addresses and pick one at checkout
+// instead of retyping every time. CRUD scoped to the logged-in user only.
+app.get('/api/user/addresses', auth, async (req,res) => {
+    try {
+        const user = await User.findById(req.user.id).select('savedAddresses');
+        if (!user) return res.status(404).json({ message:'User not found' });
+        res.json({ addresses: user.savedAddresses || [] });
+    } catch { res.status(500).json({ message:'Failed to fetch addresses' }); }
+});
+
+app.post('/api/user/addresses', auth, async (req,res) => {
+    try {
+        const { label, name, phone, line1, line2, city, state, pin, isDefault } = req.body;
+        if (!name || !phone || !line1 || !city || !state || !pin) {
+            return res.status(400).json({ message:'Name, phone, address line, city, state, and pincode are all required.' });
+        }
+        const pinRx = /^\d{6}$/;
+        if (!pinRx.test(String(pin).trim())) return res.status(400).json({ message:'Pincode must be exactly 6 digits.' });
+
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message:'User not found' });
+
+        // Cap saved addresses at a sane number — this is a convenience feature,
+        // not an address book product. Oldest gets the cap; if the customer
+        // truly needs more than this, they're an edge case worth talking to.
+        if (user.savedAddresses.length >= 10) {
+            return res.status(400).json({ message:'You can save up to 10 addresses. Please delete one before adding another.' });
+        }
+
+        const newAddr = {
+            addressId: `addr-${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`,
+            label: (label||'Home').trim(), name: name.trim(), phone: phone.trim(),
+            line1: line1.trim(), line2: (line2||'').trim(), city: city.trim(),
+            state: state.trim(), pin: String(pin).trim(),
+            isDefault: !!isDefault
+        };
+        // Only one address can be default — unset any existing default if this one claims it
+        if (newAddr.isDefault) user.savedAddresses.forEach(a => a.isDefault = false);
+        // If this is the very first address being saved, make it default automatically
+        if (!user.savedAddresses.length) newAddr.isDefault = true;
+
+        user.savedAddresses.push(newAddr);
+        await user.save();
+        res.status(201).json({ addresses: user.savedAddresses });
+    } catch(e) { res.status(400).json({ message:e.message || 'Failed to save address' }); }
+});
+
+app.put('/api/user/addresses/:addressId', auth, async (req,res) => {
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message:'User not found' });
+        const addr = user.savedAddresses.find(a => a.addressId === req.params.addressId);
+        if (!addr) return res.status(404).json({ message:'Address not found' });
+
+        const { label, name, phone, line1, line2, city, state, pin, isDefault } = req.body;
+        if (pin && !/^\d{6}$/.test(String(pin).trim())) return res.status(400).json({ message:'Pincode must be exactly 6 digits.' });
+
+        if (label!==undefined) addr.label = label.trim();
+        if (name!==undefined)  addr.name  = name.trim();
+        if (phone!==undefined) addr.phone = phone.trim();
+        if (line1!==undefined) addr.line1 = line1.trim();
+        if (line2!==undefined) addr.line2 = line2.trim();
+        if (city!==undefined)  addr.city  = city.trim();
+        if (state!==undefined) addr.state = state.trim();
+        if (pin!==undefined)   addr.pin   = String(pin).trim();
+        if (isDefault) user.savedAddresses.forEach(a => a.isDefault = a.addressId === addr.addressId);
+
+        await user.save();
+        res.json({ addresses: user.savedAddresses });
+    } catch(e) { res.status(400).json({ message:e.message || 'Failed to update address' }); }
+});
+
+app.delete('/api/user/addresses/:addressId', auth, async (req,res) => {
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message:'User not found' });
+        const wasDefault = user.savedAddresses.find(a => a.addressId === req.params.addressId)?.isDefault;
+        user.savedAddresses = user.savedAddresses.filter(a => a.addressId !== req.params.addressId);
+        // If the deleted address was the default and others remain, promote the first one
+        if (wasDefault && user.savedAddresses.length) user.savedAddresses[0].isDefault = true;
+        await user.save();
+        res.json({ addresses: user.savedAddresses });
+    } catch { res.status(500).json({ message:'Failed to delete address' }); }
+});
+
 function commissionConfirmEmail(c) {
     const typeIcon = c.type==='Custom Pattern Only'?'📐':c.type==='Fully Crocheted Piece'?'🧸':c.type==='1-on-1 Workshop'?'📅':'✦';
     return emailWrap(`
@@ -750,7 +972,7 @@ function commissionConfirmEmail(c) {
     </div>
     <div style="background:linear-gradient(135deg,rgba(212,116,140,0.08),rgba(139,50,82,0.05));border-radius:14px;padding:16px 20px;text-align:center;">
       <div style="font-size:0.72rem;font-weight:800;color:#D4748C;margin-bottom:8px;">Track your commission anytime at</div>
-      <a href="${process.env.STORE_URL||'http://localhost:5000'}/#custom" style="font-weight:700;color:#8B3252;font-size:0.88rem;">${process.env.STORE_URL||'http://localhost:5000'}</a>
+      <a href="${STORE_URL}/#custom" style="font-weight:700;color:#8B3252;font-size:0.88rem;">${STORE_URL}</a>
       <div style="font-size:0.72rem;color:rgba(61,26,14,0.4);margin-top:4px;">Using your Commission ID: <strong>${c.commissionId}</strong></div>
     </div>
     <div style="text-align:center;margin-top:24px;padding-top:20px;border-top:1px solid rgba(212,116,140,0.1);">
@@ -782,7 +1004,7 @@ function commissionStatusEmail(c) {
     ${c.quotedPrice?`<div style="background:white;border:2px dashed rgba(212,160,74,0.4);border-radius:14px;padding:16px 20px;margin-bottom:20px;text-align:center;"><div style="font-size:0.72rem;font-weight:800;color:rgba(61,26,14,0.45);margin-bottom:6px;">Quoted Price</div><div style="font-family:Georgia,serif;font-size:2rem;font-weight:700;color:#3D1A0E;">₹${c.quotedPrice.toLocaleString('en-IN')}</div></div>`:''}
     ${c.adminNote?`<div style="background:white;border-left:3px solid #D4748C;border-radius:0 14px 14px 0;padding:16px 20px;margin-bottom:20px;"><div style="font-size:0.6rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#D4748C;margin-bottom:8px;">📌 Message from Design Den</div><div style="font-size:0.85rem;color:rgba(61,26,14,0.7);line-height:1.65;">${c.adminNote}</div></div>`:''}
     <div style="text-align:center;margin-top:20px;">
-      <a href="${process.env.STORE_URL||'http://localhost:5000'}/#custom" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:13px 32px;border-radius:999px;font-weight:800;font-size:0.8rem;letter-spacing:2px;text-transform:uppercase;">Track Commission →</a>
+      <a href="${STORE_URL}/#custom" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:13px 32px;border-radius:999px;font-weight:800;font-size:0.8rem;letter-spacing:2px;text-transform:uppercase;">Track Commission →</a>
     </div>`)
 }
 
@@ -802,6 +1024,7 @@ app.post('/api/coupons/validate', async (req,res) => {
 });
 
 // Public settings
+
 app.get('/api/settings/public', async (_,res) => {
     try {
         const keys = ['store.name','store.tagline','store.whatsapp','store.instagram','shipping.freeAbove','shipping.fee','shipping.days','shipping.cod','marquee.items'];
@@ -877,15 +1100,30 @@ async function computeTrustedOrderTotals(items, couponCode) {
 
     const ids = items.map(i => i._id || i.productId).filter(Boolean);
     const dbProducts = await Product.find({ _id: { $in: ids } });
-    const priceMap = new Map(dbProducts.map(p => [String(p._id), p.price]));
+    const productMap = new Map(dbProducts.map(p => [String(p._id), p]));
+
+    // NEW: resolves the correct trusted price for a cart item, accounting for
+    // variants. If the item specifies a variantId, the price comes from that
+    // SPECIFIC variant in the DB (never trusting any price the client sent) —
+    // same trust model as before, just variant-aware. Falls back to the
+    // product's own price when there's no variantId (non-variant product).
+    function resolveTrustedPrice(product, item) {
+        if (item.variantId && product.variants && product.variants.length) {
+            const v = product.variants.find(v => v.variantId === item.variantId);
+            if (!v) throw new Error(`Variant not found: ${item.variantId} on ${product.name}`);
+            if (!v.active) throw new Error(`"${product.name} — ${v.label}" is no longer available`);
+            return v.price;
+        }
+        return product.price;
+    }
 
     let subtotal = 0;
     for (const item of items) {
         const pid = String(item._id || item.productId || '');
         const qty = Math.max(1, parseInt(item.qty, 10) || 1);
-        const dbPrice = priceMap.get(pid);
-        if (dbPrice === undefined) throw new Error(`Product not found: ${pid}`);
-        subtotal += dbPrice * qty;
+        const product = productMap.get(pid);
+        if (!product) throw new Error(`Product not found: ${pid}`);
+        subtotal += resolveTrustedPrice(product, item) * qty;
     }
 
     let discount = 0, appliedCoupon = null;
@@ -927,7 +1165,27 @@ app.get('/api/orders/:orderId', auth, async (req,res) => {
         res.json({ order:o });
     } catch { res.status(500).json({ message:'Server error' }); }
 });
-app.post('/api/orders', auth, async (req,res) => {
+// NEW: guest order tracking — no account, no login, so lookup is by order ID +
+// the email used at checkout (same pattern as the existing commission tracker).
+// Scoped to guest orders only (isGuestOrder:true) — a guest providing someone's
+// order ID can't use this to peek at a logged-in customer's order, since those
+// don't have guestEmail set and this query filters strictly on it.
+app.post('/api/orders/track', async (req,res) => {
+    try {
+        const { orderId, email } = req.body;
+        const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+        if (!orderId) return res.status(400).json({ message:'Order ID is required' });
+        if (!email || !emailRx.test(String(email).trim().toLowerCase())) return res.status(400).json({ message:'Enter a valid email address' });
+        const o = await Order.findOne({
+            id: String(orderId).trim().toUpperCase(),
+            isGuestOrder: true,
+            guestEmail: String(email).trim().toLowerCase()
+        }).select('-__v');
+        if (!o) return res.status(404).json({ message:'Order not found. Check your Order ID and email.' });
+        res.json({ order:o });
+    } catch { res.status(500).json({ message:'Server error' }); }
+});
+app.post('/api/orders', optionalAuth, async (req,res) => {
     // ── Stock handling rewritten: previously stock was decremented AFTER order
     // creation, in a loop, with no atomicity — two simultaneous orders for the
     // last unit of a product could both succeed (overselling), and a failed
@@ -936,36 +1194,76 @@ app.post('/api/orders', auth, async (req,res) => {
     // conditional update (stock >= qty) so concurrent requests can't both win.
     // If any item can't be reserved, roll back everything already reserved and
     // fail the whole order — no partial/oversold orders.
-    const reserved = []; // tracks {productId, qty} successfully decremented, for rollback
+    //
+    // NEW (variants): when an item carries a variantId, the reservation targets
+    // that specific variant's stock field inside the variants array, using
+    // Mongo's arrayFilters to update only the matching array element atomically.
+    // Items without a variantId behave exactly as before (product-level stock).
+    const reserved = []; // tracks {productId, variantId|null, qty} successfully decremented, for rollback
     try {
-        const { items, status, date, address, payment, coupon } = req.body; // Removed client-sent `id`
+        const { items, status, date, address, payment, coupon, guestEmail, guestPhone } = req.body; // Removed client-sent `id`
         if (!items || !items.length) return res.status(400).json({ message:'Missing required fields' });
+
+        // NEW: guest checkout. If there's no logged-in user (req.user is null from
+        // optionalAuth), this order has no account behind it — we still need a way
+        // to reach the customer and let them look up their order later, so email
+        // is required for guests (phone strongly recommended, used for delivery).
+        const isGuest = !req.user;
+        if (isGuest) {
+            const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+            if (!guestEmail || !emailRx.test(String(guestEmail).trim().toLowerCase())) {
+                return res.status(400).json({ message:'A valid email is required to place an order as a guest.' });
+            }
+        }
 
         const { subtotal, discount, coupon:appliedCoupon, shipping, total } = await computeTrustedOrderTotals(items, coupon);
 
         // ── Atomically reserve stock for every item, one at a time ──
         for (const item of items) {
             const pid = item._id || item.productId;
+            const variantId = item.variantId || null;
             const qty = Math.max(1, parseInt(item.qty, 10) || 1);
             if (!pid) continue;
-            const updated = await Product.findOneAndUpdate(
-                { _id: pid, stock: { $gte: qty } },        // only matches if enough stock remains
-                { $inc: { stock: -qty }, updatedAt: new Date() },
-                { new: true }
-            );
+
+            let updated;
+            if (variantId) {
+                updated = await Product.findOneAndUpdate(
+                    { _id: pid, variants: { $elemMatch: { variantId, stock: { $gte: qty } } } },
+                    { $inc: { 'variants.$[v].stock': -qty }, updatedAt: new Date() },
+                    { new: true, arrayFilters: [{ 'v.variantId': variantId }] }
+                );
+                if (updated) await updated.save(); // re-run pre-save hook to refresh derived top-level stock/price
+            } else {
+                updated = await Product.findOneAndUpdate(
+                    { _id: pid, stock: { $gte: qty } },        // only matches if enough stock remains
+                    { $inc: { stock: -qty }, updatedAt: new Date() },
+                    { new: true }
+                );
+            }
+
             if (!updated) {
-                // Not enough stock (or product missing) — roll back everything reserved so far
+                // Not enough stock (or product/variant missing) — roll back everything reserved so far
                 for (const r of reserved) {
-                    await Product.findByIdAndUpdate(r.productId, { $inc: { stock: r.qty } }).catch(()=>{});
+                    if (r.variantId) {
+                        await Product.findOneAndUpdate(
+                            { _id: r.productId },
+                            { $inc: { 'variants.$[v].stock': r.qty } },
+                            { arrayFilters: [{ 'v.variantId': r.variantId }] }
+                        ).catch(()=>{});
+                    } else {
+                        await Product.findByIdAndUpdate(r.productId, { $inc: { stock: r.qty } }).catch(()=>{});
+                    }
                 }
-                const p = await Product.findById(pid).select('name stock');
+                const p = await Product.findById(pid).select('name stock variants');
+                const variantLabel = variantId && p ? p.variants.find(v=>v.variantId===variantId)?.label : null;
+                const availableStock = variantId && p ? (p.variants.find(v=>v.variantId===variantId)?.stock ?? 0) : p?.stock;
                 return res.status(409).json({
                     message: p
-                        ? `Sorry, "${p.name}" only has ${p.stock} left in stock. Please update your cart.`
+                        ? `Sorry, "${p.name}${variantLabel ? ' — '+variantLabel : ''}" only has ${availableStock} left in stock. Please update your cart.`
                         : 'One of the items in your cart is no longer available.'
                 });
             }
-            reserved.push({ productId: pid, qty });
+            reserved.push({ productId: pid, variantId, qty });
         }
 
         // Fetch default delivery days from Settings
@@ -978,7 +1276,10 @@ app.post('/api/orders', auth, async (req,res) => {
         let order;
         try {
             order = await Order.create({
-                userId:req.user.id,
+                userId: req.user ? req.user.id : null,
+                guestEmail: isGuest ? String(guestEmail).trim().toLowerCase() : '',
+                guestPhone: isGuest ? String(guestPhone || '').trim() : '',
+                isGuestOrder: isGuest,
                 id: orderId,
                 items,
                 total,
@@ -992,15 +1293,25 @@ app.post('/api/orders', auth, async (req,res) => {
                 deliveryDays: defaultDeliveryDays
             });
         } catch (createErr) {
-            // Order creation failed AFTER stock was reserved — roll back stock before re-throwing
+            // Order creation failed AFTER stock was reserved — roll back stock before re-throwing.
+            // NEW: variant-aware rollback (previously this only handled product-level stock).
             for (const r of reserved) {
-                await Product.findByIdAndUpdate(r.productId, { $inc: { stock: r.qty } }).catch(()=>{});
+                if (r.variantId) {
+                    await Product.findOneAndUpdate(
+                        { _id: r.productId },
+                        { $inc: { 'variants.$[v].stock': r.qty } },
+                        { arrayFilters: [{ 'v.variantId': r.variantId }] }
+                    ).catch(()=>{});
+                } else {
+                    await Product.findByIdAndUpdate(r.productId, { $inc: { stock: r.qty } }).catch(()=>{});
+                }
             }
             throw createErr;
         }
 
         if (appliedCoupon) await Coupon.findOneAndUpdate({ code:appliedCoupon },{ $inc:{ usedCount:1 } });
-        await User.findByIdAndUpdate(req.user.id, { $inc:{ totalSpent:total, orderCount:1 } });
+        // NEW: only registered accounts accumulate totalSpent/orderCount — guests have no User document
+        if (req.user) await User.findByIdAndUpdate(req.user.id, { $inc:{ totalSpent:total, orderCount:1 } });
 
         res.status(201).json({ order });
     } catch(err) {
@@ -1012,7 +1323,7 @@ app.post('/api/orders', auth, async (req,res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  PAYMENT — Razorpay
 // ═══════════════════════════════════════════════════════════════════════════════
-app.post('/api/payment/create-order', auth, async (req,res) => {
+app.post('/api/payment/create-order', optionalAuth, async (req,res) => {
     try {
         const { items, coupon } = req.body;
         const { total } = await computeTrustedOrderTotals(items, coupon);
@@ -1021,7 +1332,7 @@ app.post('/api/payment/create-order', auth, async (req,res) => {
         res.json({ orderId:rzpOrder.id, amount:rzpOrder.amount, key:process.env.RAZORPAY_KEY_ID, total });
     } catch(err) { res.status(500).json({ message:'Payment order creation failed: '+err.message }); }
 });
-app.post('/api/payment/verify', auth, (req,res) => {
+app.post('/api/payment/verify', optionalAuth, (req,res) => {
     try {
         const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
         const expected = crypto.createHmac('sha256',process.env.RAZORPAY_KEY_SECRET).update(razorpay_order_id+'|'+razorpay_payment_id).digest('hex');
@@ -1098,8 +1409,55 @@ app.get('/api/admin/products', adminAuth, async (req,res) => {
     } catch { res.status(500).json({ message:'Failed to fetch products' }); }
 });
 app.post('/api/admin/products',              adminAuth, async (req,res) => { try{res.status(201).json({product:await Product.create({...req.body,updatedAt:new Date()})});}catch(e){res.status(400).json({message:e.message});} });
-app.put('/api/admin/products/:id',           adminAuth, async (req,res) => { try{const p=await Product.findByIdAndUpdate(req.params.id,{...req.body,updatedAt:new Date()},{new:true,runValidators:true});if(!p)return res.status(404).json({message:'Not found'});res.json({product:p});}catch(e){res.status(400).json({message:e.message});} });
-app.patch('/api/admin/products/:id/stock',   adminAuth, async (req,res) => { try{const{stock,delta}=req.body;const p=await Product.findById(req.params.id);if(!p)return res.status(404).json({message:'Not found'});if(delta!==undefined)p.stock=Math.max(0,p.stock+delta);else if(stock!==undefined)p.stock=Math.max(0,stock);p.updatedAt=new Date();await p.save();res.json({product:p});}catch(e){res.status(400).json({message:e.message});} });
+// NEW: switched from findByIdAndUpdate to find+save. findByIdAndUpdate does NOT
+// run Mongoose pre('save') hooks by default — that would silently skip the
+// variant price/stock sync hook above whenever a product was edited via this
+// route, leaving the top-level price/stock stale and out of sync with variants.
+app.put('/api/admin/products/:id', adminAuth, async (req,res) => {
+    try {
+        const p = await Product.findById(req.params.id);
+        if (!p) return res.status(404).json({ message:'Not found' });
+        Object.assign(p, req.body, { updatedAt:new Date() });
+        await p.save(); // runs validators + the pre-save variant sync hook
+        res.json({ product:p });
+    } catch(e) { res.status(400).json({ message:e.message }); }
+});
+app.patch('/api/admin/products/:id/stock',   adminAuth, async (req,res) => {
+    try {
+        const { stock, delta } = req.body;
+        const p = await Product.findById(req.params.id);
+        if (!p) return res.status(404).json({ message:'Not found' });
+        if (p.variants && p.variants.length) {
+            // NEW: with variants present, top-level stock is a derived sum — editing
+            // it directly here would be silently overwritten by the next save's sync
+            // hook anyway. Point the admin at the correct endpoint instead of letting
+            // them think the edit took effect.
+            return res.status(400).json({ message:'This product has variants — update stock per-variant via PATCH /api/admin/products/:id/variants/:variantId/stock' });
+        }
+        if (delta!==undefined) p.stock=Math.max(0,p.stock+delta);
+        else if (stock!==undefined) p.stock=Math.max(0,stock);
+        p.updatedAt=new Date();
+        await p.save();
+        res.json({ product:p });
+    } catch(e) { res.status(400).json({ message:e.message }); }
+});
+// NEW: dedicated route for adjusting a single variant's stock without touching
+// the others. Used by the admin "quick stock update" UI when a product has
+// variants (color/weight options), each tracked independently.
+app.patch('/api/admin/products/:id/variants/:variantId/stock', adminAuth, async (req,res) => {
+    try {
+        const { stock, delta } = req.body;
+        const p = await Product.findById(req.params.id);
+        if (!p) return res.status(404).json({ message:'Product not found' });
+        const v = p.variants.find(v => v.variantId === req.params.variantId);
+        if (!v) return res.status(404).json({ message:'Variant not found' });
+        if (delta!==undefined) v.stock = Math.max(0, v.stock + delta);
+        else if (stock!==undefined) v.stock = Math.max(0, stock);
+        p.updatedAt = new Date();
+        await p.save(); // re-syncs top-level stock total via the pre-save hook
+        res.json({ product:p });
+    } catch(e) { res.status(400).json({ message:e.message }); }
+});
 app.patch('/api/admin/products/:id/toggle',  adminAuth, async (req,res) => { try{const{field}=req.body;if(!['featured','active'].includes(field))return res.status(400).json({message:'Invalid field'});const p=await Product.findById(req.params.id);if(!p)return res.status(404).json({message:'Not found'});p[field]=!p[field];p.updatedAt=new Date();await p.save();res.json({product:p});}catch{res.status(500).json({message:'Server error'});} });
 app.delete('/api/admin/products/:id',        adminAuth, async (req,res) => { try{const p=await Product.findByIdAndUpdate(req.params.id,{active:false,updatedAt:new Date()},{new:true});if(!p)return res.status(404).json({message:'Not found'});res.json({success:true});}catch{res.status(500).json({message:'Failed to delete'});} });
 
@@ -1207,7 +1565,11 @@ app.get('/api/admin/customers', adminAuth, async (req,res) => {
         const q = search ? { $or:[{ name:new RegExp(search,'i') },{ email:new RegExp(search,'i') }] } : {};
         const users = await User.find(q).select('-password -__v').sort({ createdAt:-1 });
         const counts = await Order.aggregate([{ $group:{ _id:'$userId', count:{ $sum:1 }, total:{ $sum:'$total' } } }]);
-        const map = Object.fromEntries(counts.map(c=>[c._id.toString(),c]));
+        // NEW: guest orders have userId:null, which now shows up as a `_id: null`
+        // group here. Filter it out before building the lookup map — calling
+        // .toString() on a null _id would otherwise throw and crash this whole
+        // endpoint. Guest orders correctly have no per-user stats to attach to.
+        const map = Object.fromEntries(counts.filter(c => c._id).map(c=>[c._id.toString(),c]));
         res.json({ customers: users.map(u => ({ ...u.toObject(), orderCount:map[u._id.toString()]?.count||0, totalSpent:map[u._id.toString()]?.total||0 })) });
     } catch { res.status(500).json({ message:'Failed to fetch customers' }); }
 });
@@ -1245,7 +1607,17 @@ app.put('/api/admin/settings', adminAuth, async (req,res) => {
 // either form, so omitting the path keeps this working regardless of which major
 // version actually gets installed.
 app.use((req,res) => res.status(404).json({ message:`${req.method} ${req.originalUrl} not found` }));
-app.use((err,req,res,_next) => { console.error('[Unhandled]',err); res.status(500).json({ message:'Internal server error' }); });
+app.use((err,req,res,_next) => {
+    // NEW: CORS rejections get their own clear response instead of falling
+    // through to the generic 500 below — makes a future origin mismatch
+    // immediately diagnosable from the response itself (and from the
+    // "CORS rejected request from origin" warning already logged above),
+    // rather than looking like an unrelated server crash.
+    if (err.message === 'Not allowed by CORS') {
+        return res.status(403).json({ message:'This origin is not permitted to access the API.' });
+    }
+    console.error('[Unhandled]',err); res.status(500).json({ message:'Internal server error' });
+});
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
