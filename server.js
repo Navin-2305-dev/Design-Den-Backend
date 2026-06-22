@@ -31,18 +31,34 @@ app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy:false, crossOriginEmbedderPolicy:false }));
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
-// NOTE on CORS: origin:true currently reflects ANY calling origin. This is fine for
-// the public, read-only endpoints (products/patterns/gallery) but looser than ideal
-// for /api/auth, /api/orders, /api/admin. Once you have a fixed production domain,
-// tighten this — see ALLOWED_ORIGINS below for a ready-to-use pattern.
+// CORS Configuration for Vercel Frontend
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
-app.use(cors({
-    origin: ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : true, // falls back to open CORS until ALLOWED_ORIGINS is set in .env
-    methods:['GET','POST','PUT','DELETE','PATCH','OPTIONS'],
-    allowedHeaders:['Content-Type','Authorization','X-Admin-Key'],
-    credentials:false,
-    optionsSuccessStatus:200
-}));
+
+// CORS configuration with proper origin handling
+const corsOptions = {
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps, Postman, or curl)
+        if (!origin) return callback(null, true);
+        
+        // If ALLOWED_ORIGINS is set, check against the list
+        if (ALLOWED_ORIGINS.length > 0) {
+            if (ALLOWED_ORIGINS.indexOf(origin) !== -1) {
+                callback(null, true);
+            } else {
+                callback(new Error('Not allowed by CORS'));
+            }
+        } else {
+            // Fallback: allow all origins if ALLOWED_ORIGINS is not set
+            callback(null, true);
+        }
+    },
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Key'],
+    credentials: true, // Changed to true to support cookies/auth headers
+    optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
 app.use(express.json({ limit:'10mb' }));
 app.use((req,_,next)=>{ console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.path}`); next(); });
 
