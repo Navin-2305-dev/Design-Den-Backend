@@ -89,11 +89,13 @@ const apiLimiter = rateLimit({
 });
 app.use('/api/', apiLimiter); // baseline floor across all API routes
 
-// ─── Static Files ─────────────────────────────────────────────────────────────
-app.use(express.static(path.join(__dirname)));
-app.get('/',     (_,res) => res.sendFile(path.join(__dirname, 'index.html')));
-app.get('/store',(_,res) => res.sendFile(path.join(__dirname, 'index.html')));
-app.get('/admin',(_,res) => res.sendFile(path.join(__dirname, 'admin.html')));
+// ─── Health Check Route ───────────────────────────────────────────────────────
+// Frontend is hosted separately on Vercel/Netlify
+app.get('/', (_,res) => res.json({
+    status: 'ok',
+    message: 'Design Den API Server',
+    frontend: process.env.FRONTEND_URL || 'Not configured'
+}));
 
 // ─── MongoDB ──────────────────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGO_URI, { dbName:'design_den' })
