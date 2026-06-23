@@ -146,7 +146,7 @@ mongoose.connect(process.env.MONGO_URI, { dbName:'design_den' })
 const variantSchema = new mongoose.Schema({
     variantId: { type:String, required:true },              // e.g. "red-100g", stable, set once
     label:     { type:String, required:true, trim:true },   // e.g. "Sunset Red"
-    type:      { type:String, default:'option', enum:['color','weight','option'] },
+    type:      { type:String, default:'option', enum:['color','Types','option'] },
     swatch:    { type:String, default:'' },                 // hex color or small image URL for color swatches
     img:       { type:String, default:'' },                 // optional variant-specific photo (falls back to product img)
     price:     { type:Number, required:true, min:0 },
@@ -159,7 +159,7 @@ const productSchema = new mongoose.Schema({
     name:          { type:String, required:true, trim:true },
     price:         { type:Number, required:true, min:0 }, // base/display price — see variants note above
     originalPrice: { type:Number, default:null },
-    category:      { type:String, required:true, enum:['yarn','kit','hook','bundle'] },
+    category:      { type:String, required:true, enum:['yarn','kit','hook','Toy','Accessories','Keychains','flower'] },
     stock:         { type:Number, required:true, default:0, min:0 }, // ignored once variants exist — see note above
     rating:        { type:Number, default:4.8, min:1, max:5 },
     reviewCount:   { type:Number, default:0 },
@@ -513,68 +513,6 @@ function adminAuth(req, res, next) {
         if (!payload.isAdmin) return res.status(403).json({ message:'Admin access only' });
         req.user = payload; next();
     } catch { res.status(401).json({ message:'Invalid admin token' }); }
-}
-
-// ─── DB Seed ──────────────────────────────────────────────────────────────────
-async function seedDB() {
-    if (await Product.countDocuments() > 0) return;
-    console.log('🌱 Seeding initial data…');
-    await Product.insertMany([
-        { name:"Cotton Candy Dream",       price:399,  category:"yarn",   stock:34, rating:5.0, reviewCount:186, img:"https://picsum.photos/id/201/600/600", desc:"100% premium Merino wool from Tamil Nadu farms. Buttery soft, perfect for baby blankets.", badge:"bestseller", featured:true,  sku:"DD-Y-001", weight:"100g", material:"Merino Wool" },
-        { name:"Rainbow Haze Variegated",  price:549,  category:"yarn",   stock:12, rating:4.8, reviewCount:94,  img:"https://picsum.photos/id/29/600/600",  desc:"Hand-dyed 100% cotton. Vibrant colour changes. Great for shawls & scarves.", badge:"hot", sku:"DD-Y-002", weight:"100g", material:"100% Cotton" },
-        { name:"Bunny Hug Amigurumi Kit",  price:899,  category:"kit",    stock:8,  rating:5.0, reviewCount:212, img:"https://picsum.photos/id/160/600/600", desc:"Complete kit: yarn, safety eyes, stuffing, pattern. Make your own adorable bunny!", badge:"hot", featured:true, sku:"DD-K-001" },
-        { name:"Ergonomic Hook Set (12pc)",price:699,  category:"hook",   stock:45, rating:4.9, reviewCount:301, img:"https://picsum.photos/id/180/600/600", desc:"Aluminium hooks with soft comfort grip. Perfect tension every stitch.", sku:"DD-H-001" },
-        { name:"Golden Sunset Bundle",     price:1299, category:"bundle", stock:19, rating:5.0, reviewCount:78,  img:"https://picsum.photos/id/1015/600/600", desc:"4 skeins + exclusive pattern + ergonomic hook. Limited edition sunset tones.", badge:"new", featured:true, sku:"DD-B-001" },
-        { name:"Cozy Cactus Kit",          price:799,  category:"kit",    stock:22, rating:4.7, reviewCount:143, img:"https://picsum.photos/id/201/600/600", desc:"Make your own rainbow cactus family. Beginner friendly, zero tools needed.", badge:"new", sku:"DD-K-002" },
-        { name:"Silky Bamboo Yarn (100g)", price:449,  category:"yarn",   stock:51, rating:4.9, reviewCount:167, img:"https://picsum.photos/id/129/600/600", desc:"Sustainably sourced bamboo fibre. Lightweight with gorgeous drape.", sku:"DD-Y-003", weight:"100g", material:"Bamboo" },
-        { name:"Cloud Baby Blanket Kit",   price:1599, category:"bundle", stock:6,  rating:5.0, reviewCount:89,  img:"https://picsum.photos/id/402/600/600", desc:"Everything you need for a dreamy baby blanket. Includes pattern video access.", sku:"DD-B-002", featured:true }
-    ]);
-    await Coupon.insertMany([
-        { code:"WELCOME10", type:"pct",  val:10,  desc:"10% off your first order",             maxUses:200,  status:"Active" },
-        { code:"YARN20",    type:"pct",  val:20,  desc:"20% off for yarn lovers",               maxUses:100,  status:"Active" },
-        { code:"FLAT100",   type:"flat", val:100, desc:"₹100 off on orders above ₹500", min:500,maxUses:500,  status:"Active" },
-        { code:"NEWSTITCH", type:"pct",  val:15,  desc:"15% off for new members",               maxUses:300,  status:"Active" },
-        { code:"CHENNAI",   type:"flat", val:50,  desc:"₹50 off — local Chennai love",          maxUses:null, status:"Active" },
-    ]);
-    await Pattern.insertMany([
-        { name:"Granny Square Classic", level:"Beginner",     time:"2 hrs", price:0,  img:"https://picsum.photos/id/70/400/300",  desc:"A timeless classic perfect for beginners. Learn the granny square technique step by step.", downloads:1240, status:"Published" },
-        { name:"Bobble Stitch Cushion", level:"Intermediate", time:"4 hrs", price:49, img:"https://picsum.photos/id/96/400/300",  desc:"Create a gorgeous textured cushion with bobble stitches. Pattern includes video walkthrough.", downloads:876,  status:"Published" },
-        { name:"Starfish Amigurumi",    level:"Beginner",     time:"3 hrs", price:0,  img:"https://picsum.photos/id/146/400/300", desc:"An adorable free amigurumi starfish pattern. Great for gifts!", downloads:654,  status:"Published" },
-        { name:"Lacy Shawl Pattern",    level:"Advanced",     time:"8 hrs", price:99, img:"https://picsum.photos/id/167/400/300", desc:"An elegant lacy shawl with detailed charts and written instructions.", downloads:423,  status:"Published" },
-    ]);
-    await Testimonial.insertMany([
-        { name:"Priya Menon",     loc:"Chennai",    rating:5, text:"Design Den completely transformed my crochet journey. The Cotton Candy yarn is absolutely divine — I've gifted three blankets already!", emoji:"🌸", status:"Published" },
-        { name:"Lakshmi Rajan",   loc:"Coimbatore", rating:5, text:"The Amigurumi kits are insanely good. My daughter's bunny is so cute everyone thinks it's from abroad!", emoji:"🐰", status:"Published" },
-        { name:"Ananya Krishnan", loc:"Bangalore",  rating:5, text:"I went from zero to crocheting my first cardigan in two months. Navin is so patient and knowledgeable!", emoji:"✨", status:"Published" },
-        { name:"Meera Iyer",      loc:"Mumbai",     rating:5, text:"Fast shipping, gorgeous yarns, and the patterns are so well-written. My go-to store.", emoji:"🧶", status:"Published" },
-        { name:"Divya Suresh",    loc:"Hyderabad",  rating:5, text:"The ergonomic hook set saved my wrists! Seriously life-changing for someone who crochets daily.", emoji:"💝", status:"Published" },
-        { name:"Nithya Pillai",   loc:"Kochi",      rating:5, text:"The bundles are incredible value. Got the Golden Sunset set and the colours are breathtaking!", emoji:"🌅", status:"Published" },
-    ]);
-    await Gallery.insertMany([
-        { url:"https://picsum.photos/id/1003/600/600", caption:"Granny Square Blanket",  sortOrder:1 },
-        { url:"https://picsum.photos/id/1011/600/800", caption:"Rainbow Baby Set",       sortOrder:2 },
-        { url:"https://picsum.photos/id/1015/600/600", caption:"Sunset Shawl",           sortOrder:3 },
-        { url:"https://picsum.photos/id/1016/600/600", caption:"Bunny Amigurumi",        sortOrder:4 },
-        { url:"https://picsum.photos/id/1018/600/800", caption:"Lacy Table Runner",      sortOrder:5 },
-        { url:"https://picsum.photos/id/1019/600/600", caption:"Crochet Top",            sortOrder:6 },
-        { url:"https://picsum.photos/id/1021/600/600", caption:"Holiday Ornaments",      sortOrder:7 },
-        { url:"https://picsum.photos/id/1022/600/600", caption:"Workshop Project",       sortOrder:8 },
-    ]);
-    await Settings.insertMany([
-        { key:'store.name',         value:'Design Den' },
-        { key:'store.tagline',      value:'Handcrafted crochet from Chennai, Tamil Nadu' },
-        { key:'store.address',      value:'Chennai, Tamil Nadu, India' },
-        { key:'store.whatsapp',     value:'+919876543210' },
-        { key:'store.instagram',    value:'@designden.in' },
-        { key:'shipping.freeAbove', value:'999' },
-        { key:'shipping.fee',       value:'99' },
-        { key:'shipping.days',      value:'2' },
-        { key:'shipping.cod',       value:'Yes' },
-        { key:'pricing.tax',        value:'0' },
-        { key:'marquee.items',      value:'Free shipping over ₹999\nHandmade with love in Chennai\nNew arrivals every week\n100% natural fibres\nCustom orders welcome' },
-        { key:'admin.name',         value:'Admin' },
-    ]);
-    console.log('✅ Seed complete');
 }
 
 // ─── Health ───────────────────────────────────────────────────────────────────
@@ -1639,6 +1577,5 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, async () => {
     console.log('\n🧶 ══════════════════════════════════════════════');
     console.log(`   Design Den API  →  http://localhost:${PORT}`);
-    console.log('══════════════════════════════════════════════════\n');
-    try { await seedDB(); } catch(e) { console.error('Seed error:', e.message); }
-});
+    console.log('══════════════════════════════════════════════════\n');}
+);
