@@ -1216,6 +1216,21 @@ app.post('/api/orders', optionalAuth, async (req,res) => {
             }
         }
 
+        // NEW: enforce the shipping.cod admin toggle server-side. The frontend
+        // already hides the Cash on Delivery option when this is disabled, but
+        // that's a UX nicety, not security — anyone can POST directly to this
+        // endpoint regardless of what the checkout UI shows. Checking it here
+        // is what actually prevents a COD order from being created while the
+        // store owner has it turned off (e.g. during the early online-payment-
+        // only phase requested for this launch).
+        if (payment && payment.method === 'Cash on Delivery') {
+            const codSetting = await Settings.findOne({ key: 'shipping.cod' });
+            const codEnabled = !codSetting || codSetting.value === 'Yes'; // default to enabled if unset, matching the seeded default
+            if (!codEnabled) {
+                return res.status(400).json({ message:'Cash on Delivery is currently unavailable. Please pay online to complete your order.' });
+            }
+        }
+
         const { subtotal, discount, coupon:appliedCoupon, shipping, total } = await computeTrustedOrderTotals(items, coupon);
 
         // ── Atomically reserve stock for every item, one at a time ──
