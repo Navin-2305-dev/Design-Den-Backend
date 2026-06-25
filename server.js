@@ -78,7 +78,13 @@ app.use(cors({
     credentials:false,
     optionsSuccessStatus:200
 }));
-app.use(express.json({ limit:'10mb' }));
+// NEW: bumped from 10mb to 30mb. The admin's multi-image upload widget (and
+// per-variant photos) sends several resized-but-still-base64-encoded images
+// in a single product save — a product with ~6 gallery photos plus 4 variant
+// photos, each resized to ~150-300KB as base64, can comfortably exceed 10mb
+// even though every individual image is small. 30mb gives real headroom
+// without removing the size sanity-check entirely.
+app.use(express.json({ limit:'30mb' }));
 app.use((req,_,next)=>{ console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.path}`); next(); });
 
 // ─── Rate limiters ────────────────────────────────────────────────────────────
@@ -327,11 +333,29 @@ const commissionSchema = new mongoose.Schema({
     budget:       { type:String, default:'' },
     attachment:   { type:String, default:'' },
     attachName:   { type:String, default:'' },
-    status:       { type:String, default:'New', enum:['New','Quoted','In Progress','Completed','Cancelled'] },
+    // NEW: 'Accepted' = customer clicked "Accept Quote" but hasn't completed
+    // payment yet (covers the brief in-between window, and lets us recover
+    // gracefully if a payment is abandoned). 'Converting' is a brief, internal-
+    // only transient state used to atomically claim a commission during
+    // payment verification — see POST /commissions/:id/pay/verify — so two
+    // near-simultaneous verify calls can't both create an Order for the same
+    // payment; it should never be visible for more than a few milliseconds in
+    // practice and immediately becomes 'Converted'. 'Converted' = payment
+    // succeeded and a real Order now exists for this commission — at that
+    // point the commission itself is done tracking; the linked Order's own
+    // status (Placed → Confirmed → Processing → Shipped → Out for Delivery →
+    // Delivered) becomes the source of truth shown to the customer, the same
+    // pipeline every regular product order already goes through.
+    status:       { type:String, default:'New', enum:['New','Quoted','Accepted','Converting','In Progress','Completed','Converted','Cancelled'] },
     quotedPrice:  { type:Number, default:null },
     adminNote:    { type:String, default:'' },   // visible to customer
     internalNote: { type:String, default:'' },   // admin-only
     completedAt:  { type:Date, default:null },
+    // NEW: once a commission is paid for, this points at the resulting Order's
+    // `id` (not its Mongo _id — the same human-readable DD-XXXXXXXXXX format
+    // every other order uses), so the customer's commission tracker can pull
+    // and display that order's live delivery status instead of going stale.
+    linkedOrderId:{ type:String, default:null },
     createdAt:    { type:Date, default:Date.now }
 });
 commissionSchema.index({ email:1, createdAt:-1 });
@@ -379,21 +403,71 @@ const EmailLog    = mongoose.model('EmailLog',    emailLogSchema);
 const razorpay = new Razorpay({ key_id:process.env.RAZORPAY_KEY_ID||'rzp_test_placeholder', key_secret:process.env.RAZORPAY_KEY_SECRET||'placeholder' });
 
 // ─── Email transporter ────────────────────────────────────────────────────────
+// NEW: previously this only ever built a Gmail-service transporter — fine if
+// EMAIL_USER is a real Gmail/Google Workspace address using an App Password,
+// but completely silent-broken for anyone using a custom domain, Outlook, or
+// a transactional provider (SES, SendGrid, Mailgun, etc.) via plain SMTP.
+// Every send would fail with no visible symptom beyond an EmailLog entry
+// nothing in the admin UI used to show. Now: if SMTP_HOST is set, use a
+// generic SMTP transport (works with any provider); otherwise fall back to
+// the original Gmail-service behavior for backward compatibility with
+// existing deployments that already had EMAIL_USER/EMAIL_PASS as Gmail
+// credentials and nothing else configured.
 let mailer = null;
-if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
-    mailer = nodemailer.createTransport({
-        service: 'gmail',
-        auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+// NEW: tracks live transport health so the admin panel can show "is email
+// actually working" instead of the admin only finding out after the fact
+// from a failed-send count with no further detail.
+let mailerStatus = { configured:false, ok:null, error:null, checkedAt:null, transport:null };
+
+function _initMailer() {
+    if (process.env.SMTP_HOST) {
+        // Generic SMTP — works with any provider (custom domain mailboxes,
+        // SES, SendGrid, Mailgun, Postmark, Zoho, Outlook/Office365, etc).
+        mailer = nodemailer.createTransport({
+            host: process.env.SMTP_HOST,
+            port: parseInt(process.env.SMTP_PORT, 10) || 587,
+            secure: process.env.SMTP_SECURE === 'true', // true for port 465, false for 587/STARTTLS
+            auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: process.env.SMTP_PASS || process.env.EMAIL_PASS }
+        });
+        mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587})`;
+    } else if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+        // Backward-compatible default: Gmail service shorthand. Requires an
+        // App Password (not a regular account password) when 2FA is on,
+        // which Google effectively requires for SMTP access now — using a
+        // regular password is one of the most common causes of every send
+        // failing with an auth error.
+        mailer = nodemailer.createTransport({
+            service: 'gmail',
+            auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+        });
+        mailerStatus.transport = `Gmail (${process.env.EMAIL_USER})`;
+    } else {
+        console.warn('⚠️  No email transport configured — set EMAIL_USER/EMAIL_PASS (Gmail) or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS (any provider) to enable emails.');
+        mailerStatus = { configured:false, ok:false, error:'No EMAIL_USER/EMAIL_PASS or SMTP_HOST configured.', checkedAt:new Date(), transport:null };
+        return;
+    }
+    mailerStatus.configured = true;
+    mailer.verify(err => {
+        mailerStatus.checkedAt = new Date();
+        if (err) {
+            mailerStatus.ok = false;
+            mailerStatus.error = err.message;
+            console.warn('⚠️  Email transport error:', err.message);
+        } else {
+            mailerStatus.ok = true;
+            mailerStatus.error = null;
+            console.log('✅ Email ready —', mailerStatus.transport);
+        }
     });
-    mailer.verify(err => err ? console.warn('⚠️  Email transport error:', err.message) : console.log('✅ Email ready'));
-} else {
-    console.warn('⚠️  EMAIL_USER / EMAIL_PASS not set — emails disabled');
 }
+_initMailer();
+
+const EMAIL_FROM_ADDRESS = process.env.SMTP_USER || process.env.EMAIL_USER;
 
 async function sendMail(to, subject, html) {
-    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS missing)' }).catch(()=>{}); return; }
+    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
     try {
-        await mailer.sendMail({ from:`"Design Den 🧶" <${process.env.EMAIL_USER}>`, to, subject, html });
+        await mailer.sendMail({ from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html });
         console.log(`📧 Email sent to ${to}`);
         await EmailLog.create({ to, subject, status:'sent' }).catch(()=>{});
     } catch(err) {
@@ -404,7 +478,7 @@ async function sendMail(to, subject, html) {
 
 // ─── Email templates ──────────────────────────────────────────────────────────
 function emailWrap(body) {
-    return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Design Den</title></head>
 <body style="font-family:'Helvetica Neue',Arial,sans-serif;background:#FFF6EE;margin:0;padding:24px 0">
 <div style="max-width:580px;margin:0 auto;background:white;border-radius:28px;overflow:hidden;box-shadow:0 12px 48px rgba(61,26,14,0.1)">
   <div style="background:linear-gradient(135deg,#3D1A0E 0%,#8B3252 60%,#D4748C 100%);padding:48px 40px 40px;text-align:center;position:relative;">
@@ -424,11 +498,19 @@ function emailWrap(body) {
 function welcomeEmail(name) {
     return emailWrap(`
     <div style="text-align:center;margin-bottom:32px;">
-      <div style="display:inline-flex;align-items:center;gap:8px;background:linear-gradient(135deg,rgba(212,116,140,0.12),rgba(139,50,82,0.08));border:1.5px dashed rgba(212,116,140,0.4);border-radius:999px;padding:10px 24px;margin-bottom:28px;">
-        <span style="font-size:0.8rem;">🎀</span>
-        <span style="font-size:0.65rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;">Welcome to the Family</span>
-        <span style="font-size:0.8rem;">🎀</span>
-      </div>
+      <!-- FIXED: was display:inline-flex + gap — Outlook desktop (Word
+           rendering engine) and several other email clients don't support
+           flexbox at all, so this icon/text/icon row would collapse into 3
+           stacked lines instead of sitting on one line. A table with
+           display:inline-table (not full-width) is the standard, universally-
+           supported way to lay out a few items side-by-side in email HTML. -->
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="display:inline-table;background:linear-gradient(135deg,rgba(212,116,140,0.12),rgba(139,50,82,0.08));border:1.5px dashed rgba(212,116,140,0.4);border-radius:999px;margin-bottom:28px;">
+        <tr>
+          <td style="padding:10px 8px 10px 24px;font-size:0.8rem;white-space:nowrap;">🎀</td>
+          <td style="padding:10px 8px;font-size:0.65rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;white-space:nowrap;">Welcome to the Family</td>
+          <td style="padding:10px 24px 10px 8px;font-size:0.8rem;white-space:nowrap;">🎀</td>
+        </tr>
+      </table>
       <h1 style="font-family:Georgia,serif;font-size:2.2rem;font-weight:700;color:#3D1A0E;margin:0 0 10px;line-height:1.2;">Hi ${name}! 👋</h1>
       <p style="color:rgba(61,26,14,0.65);font-size:1rem;line-height:1.75;margin:0 0 8px;">We're so thrilled to have you join the <strong style="color:#3D1A0E;">Design Den</strong> family!</p>
       <p style="color:rgba(61,26,14,0.55);font-size:0.9rem;line-height:1.7;margin:0;">Whether you're a seasoned crafter or just picking up your first hook, you've found the right place.</p>
@@ -437,9 +519,12 @@ function welcomeEmail(name) {
     <p style="color:rgba(61,26,14,0.6);font-size:0.88rem;line-height:1.75;margin:0 0 28px;">From hand-dyed yarns and ergonomic hook sets to complete amigurumi kits and step-by-step patterns — everything you need to create something <em style="color:#8B3252;">beautiful</em> is right here.</p>
 
     <div style="background:linear-gradient(135deg,#FFF6EE,#FAE8D0);border:2px dashed rgba(212,116,140,0.35);border-radius:20px;padding:28px 32px;text-align:center;margin-bottom:32px;">
-      <div style="font-size:0.65rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;margin-bottom:14px;display:flex;align-items:center;justify-content:center;gap:8px;">
-        <span>🎁</span> Your Welcome Gift
-      </div>
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="display:inline-table;margin-bottom:14px;">
+        <tr>
+          <td style="font-size:0.65rem;padding-right:6px;">🎁</td>
+          <td style="font-size:0.65rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;white-space:nowrap;">Your Welcome Gift</td>
+        </tr>
+      </table>
       <div style="font-family:Georgia,serif;font-size:2.4rem;font-weight:700;letter-spacing:6px;color:#3D1A0E;margin-bottom:10px;">WELCOME10</div>
       <p style="font-size:0.88rem;font-weight:700;color:#3D1A0E;margin:0 0 6px;">10% off your first order — no minimum spend</p>
       <p style="font-size:0.72rem;color:rgba(61,26,14,0.45);margin:0;">Apply at checkout · Valid on any order</p>
@@ -449,23 +534,29 @@ function welcomeEmail(name) {
       <a href="${STORE_URL}" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:15px 40px;border-radius:999px;font-weight:800;font-size:0.82rem;letter-spacing:2px;text-transform:uppercase;box-shadow:0 8px 24px rgba(139,50,82,0.25);">START SHOPPING ✦</a>
     </div>
 
-    <div style="display:flex;gap:0;border-top:1px solid rgba(212,116,140,0.15);padding-top:24px;margin-top:4px;">
-      <div style="flex:1;text-align:center;padding:0 12px;">
-        <div style="font-size:1.6rem;margin-bottom:8px;">🎨</div>
-        <div style="font-size:0.72rem;font-weight:800;color:#3D1A0E;margin-bottom:4px;">Hand-Dyed Yarns</div>
-        <div style="font-size:0.66rem;color:rgba(61,26,14,0.5);">Premium &amp; vibrant</div>
-      </div>
-      <div style="flex:1;text-align:center;padding:0 12px;border-left:1px solid rgba(212,116,140,0.12);border-right:1px solid rgba(212,116,140,0.12);">
-        <div style="font-size:1.6rem;margin-bottom:8px;">🚚</div>
-        <div style="font-size:0.72rem;font-weight:800;color:#3D1A0E;margin-bottom:4px;">Free Shipping</div>
-        <div style="font-size:0.66rem;color:rgba(61,26,14,0.5);">On orders over ₹999</div>
-      </div>
-      <div style="flex:1;text-align:center;padding:0 12px;">
-        <div style="font-size:1.6rem;margin-bottom:8px;">📜</div>
-        <div style="font-size:0.72rem;font-weight:800;color:#3D1A0E;margin-bottom:4px;">Free Patterns</div>
-        <div style="font-size:0.66rem;color:rgba(61,26,14,0.5);">For every skill level</div>
-      </div>
-    </div>
+    <!-- FIXED: was display:flex with flex:1 thirds — without flex support the
+         three columns stacked into one tall column instead of sitting side
+         by side. A full-width table with three equal <td>s is the reliable
+         email-safe equivalent of "3 equal flex columns". -->
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-top:1px solid rgba(212,116,140,0.15);padding-top:24px;margin-top:4px;">
+      <tr>
+        <td width="33.33%" align="center" style="text-align:center;padding:0 12px;">
+          <div style="font-size:1.6rem;margin-bottom:8px;">🎨</div>
+          <div style="font-size:0.72rem;font-weight:800;color:#3D1A0E;margin-bottom:4px;">Hand-Dyed Yarns</div>
+          <div style="font-size:0.66rem;color:rgba(61,26,14,0.5);">Premium &amp; vibrant</div>
+        </td>
+        <td width="33.33%" align="center" style="text-align:center;padding:0 12px;border-left:1px solid rgba(212,116,140,0.12);border-right:1px solid rgba(212,116,140,0.12);">
+          <div style="font-size:1.6rem;margin-bottom:8px;">🚚</div>
+          <div style="font-size:0.72rem;font-weight:800;color:#3D1A0E;margin-bottom:4px;">Free Shipping</div>
+          <div style="font-size:0.66rem;color:rgba(61,26,14,0.5);">On orders over ₹999</div>
+        </td>
+        <td width="33.33%" align="center" style="text-align:center;padding:0 12px;">
+          <div style="font-size:1.6rem;margin-bottom:8px;">📜</div>
+          <div style="font-size:0.72rem;font-weight:800;color:#3D1A0E;margin-bottom:4px;">Free Patterns</div>
+          <div style="font-size:0.66rem;color:rgba(61,26,14,0.5);">For every skill level</div>
+        </td>
+      </tr>
+    </table>
 
     <div style="text-align:center;margin-top:28px;padding-top:20px;border-top:1px solid rgba(212,116,140,0.1);">
       <p style="font-size:0.82rem;color:rgba(61,26,14,0.55);margin:0 0 4px;">With yarn love,</p>
@@ -663,14 +754,20 @@ function patternDeliveryEmail(p, customerName, email, txnId) {
       <h2 style="font-family:Georgia,serif;font-size:1.8rem;color:#3D1A0E;margin:0 0 8px;">Hi ${customerName}! Here's Your Pattern ✦</h2>
       <p style="color:rgba(61,26,14,0.55);margin:0;font-size:0.9rem;">${isFree ? 'Enjoy your free download from Design Den!' : 'Thank you for your purchase!'}</p>
     </div>
-    <div style="display:flex;gap:14px;margin-bottom:20px;background:#F7EDE6;border-radius:14px;padding:14px;align-items:center;">
-      ${p.img ? `<img src="${p.img}" style="width:72px;height:72px;border-radius:10px;object-fit:cover;flex-shrink:0;" alt="${p.name}">` : ''}
-      <div style="flex:1;">
-        <div style="font-family:Georgia,serif;font-size:1.1rem;font-weight:700;color:#3D1A0E;">${p.name}</div>
-        <div style="font-size:0.72rem;color:rgba(61,26,14,0.5);margin-top:2px;">${p.level} · ${p.time||'Self-paced'}</div>
-        ${isFree ? '<div style="font-size:0.72rem;font-weight:800;color:#7DAA8A;margin-top:4px;">FREE PATTERN</div>' : `<div style="font-size:0.72rem;font-weight:800;color:#D4A04A;margin-top:4px;">₹${p.price} — PURCHASED ✓</div>`}
-      </div>
-    </div>
+    <!-- FIXED: was display:flex (image + text block) — collapsed into two
+         stacked rows in Outlook instead of a thumbnail beside the text.
+         Table layout keeps the thumbnail and text on one row everywhere,
+         and degrades gracefully (just one cell) when there's no image. -->
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:20px;background:#F7EDE6;border-radius:14px;">
+      <tr>
+        ${p.img ? `<td width="72" valign="middle" style="padding:14px 0 14px 14px;"><img src="${p.img}" width="72" height="72" style="display:block;width:72px;height:72px;border-radius:10px;object-fit:cover;" alt="${p.name}"></td>` : ''}
+        <td valign="middle" style="padding:14px;${p.img ? '' : 'padding-left:14px;'}">
+          <div style="font-family:Georgia,serif;font-size:1.1rem;font-weight:700;color:#3D1A0E;">${p.name}</div>
+          <div style="font-size:0.72rem;color:rgba(61,26,14,0.5);margin-top:2px;">${p.level} · ${p.time||'Self-paced'}</div>
+          ${isFree ? '<div style="font-size:0.72rem;font-weight:800;color:#7DAA8A;margin-top:4px;">FREE PATTERN</div>' : `<div style="font-size:0.72rem;font-weight:800;color:#D4A04A;margin-top:4px;">₹${p.price} — PURCHASED ✓</div>`}
+        </td>
+      </tr>
+    </table>
     ${fileSection}
     ${txnId ? `<div style="font-size:0.68rem;color:rgba(61,26,14,0.3);text-align:center;margin-bottom:16px;">Transaction ID: ${txnId}</div>` : ''}
     <div style="background:white;border:1.5px dashed rgba(212,116,140,0.3);border-radius:14px;padding:16px 20px;margin-bottom:20px;">
@@ -684,9 +781,9 @@ function patternDeliveryEmail(p, customerName, email, txnId) {
 }
 
 async function sendPatternMail(to, subject, html, fileData, fileName) {
-    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS missing)' }).catch(()=>{}); return; }
+    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
     try {
-        const mailOpts = { from:`"Design Den 🧶" <${process.env.EMAIL_USER}>`, to, subject, html };
+        const mailOpts = { from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html };
         if (fileData && fileData.startsWith('data:')) {
             const matches = fileData.match(/^data:([^;]+);base64,(.+)$/);
             if (matches) {
@@ -768,11 +865,36 @@ app.post('/api/commissions', async (req,res) => {
     } catch(err) { console.error('[POST /commissions]',err); res.status(500).json({ message:'Submission failed' }); }
 });
 
+// NEW: once a commission is paid for and converted into a real Order, the
+// customer-facing tracker should show that Order's live delivery status
+// (Placed → Confirmed → Processing → Shipped → Out for Delivery → Delivered)
+// rather than the stale "Converted" commission status — that's the whole
+// point of converting it into a trackable order in the first place. This
+// helper takes a commission doc (or array of them) and, for any that have a
+// linkedOrderId, fetches that order's status/dates and attaches it as
+// `linkedOrder` so the frontend can render real shipping progress.
+async function attachLinkedOrderStatus(commissionOrList) {
+    const list = Array.isArray(commissionOrList) ? commissionOrList : [commissionOrList];
+    const orderIds = list.map(c => c.linkedOrderId).filter(Boolean);
+    if (!orderIds.length) return commissionOrList;
+    const orders = await Order.find({ id: { $in: orderIds } })
+        .select('id status date deliveryDays createdAt total');
+    const orderMap = new Map(orders.map(o => [o.id, o]));
+    for (const c of list) {
+        if (c.linkedOrderId && orderMap.has(c.linkedOrderId)) {
+            const o = orderMap.get(c.linkedOrderId);
+            c._doc.linkedOrder = { id:o.id, status:o.status, date:o.date, deliveryDays:o.deliveryDays, total:o.total };
+        }
+    }
+    return commissionOrList;
+}
+
 app.get('/api/commissions/track/:commissionId', async (req,res) => {
     try {
         const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() })
-            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt');
+            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId');
         if (!c) return res.status(404).json({ message:'Commission not found. Please check your ID.' });
+        await attachLinkedOrderStatus(c);
         res.json({ commission: c });
     } catch { res.status(500).json({ message:'Error' }); }
 });
@@ -784,9 +906,150 @@ app.post('/api/commissions/track', async (req,res) => {
         if (!email || !emailRx.test(email.trim().toLowerCase())) return res.status(400).json({ message:'Enter a valid email address' });
         const commissions = await Commission.find({ email:email.toLowerCase().trim() })
             .sort({ createdAt:-1 })
-            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt');
+            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId');
+        await attachLinkedOrderStatus(commissions);
         res.json({ commissions });
     } catch { res.status(500).json({ message:'Error' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  COMMISSION → ORDER CONVERSION (accept quote, pay, become a tracked order)
+// ═══════════════════════════════════════════════════════════════════════════════
+// This is the missing link between "admin quoted a custom piece" and "customer
+// actually gets it delivered". Previously a Quoted commission just sat there —
+// the customer saw a price in an email/tracker but had no way to act on it, and
+// nothing ever became a real, trackable order. Now: customer accepts the quote
+// and pays for it right from the tracker, which (a) creates a Razorpay order for
+// exactly the quoted amount — never a client-supplied number, same trust model
+// as every other payment in this app — and (b), once that payment is verified,
+// creates a real Order document carrying the commission through the exact same
+// Placed → Confirmed → Processing → Shipped → Out for Delivery → Delivered
+// pipeline as a normal product purchase, fully visible in the admin Orders tab
+// right alongside everything else.
+app.post('/api/commissions/:commissionId/accept', optionalAuth, async (req,res) => {
+    try {
+        const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() });
+        if (!c) return res.status(404).json({ message:'Commission not found.' });
+        if (!['Quoted','Accepted'].includes(c.status)) return res.status(400).json({ message:'This commission does not have an active quote to accept.' });
+        if (!c.quotedPrice || c.quotedPrice <= 0) return res.status(400).json({ message:'No quoted price has been set yet.' });
+        if (c.status !== 'Accepted') { c.status = 'Accepted'; await c.save(); }
+        // Reuses the exact same Razorpay order-creation shape as /api/payment/create-order,
+        // just sourcing the amount from the commission's quotedPrice instead of a cart total.
+        const rzpOrder = await razorpay.orders.create({
+            amount: Math.round(c.quotedPrice * 100),
+            currency: 'INR',
+            receipt: `DDC_${Date.now().toString(36)}`.slice(0, 40)
+        });
+        res.json({ orderId: rzpOrder.id, key: process.env.RAZORPAY_KEY_ID || 'rzp_test_placeholder', amount: c.quotedPrice });
+    } catch (err) { console.error('[POST /commissions/:id/accept]', err); res.status(500).json({ message:'Could not start payment. Please try again.' }); }
+});
+
+app.post('/api/commissions/:commissionId/pay/verify', optionalAuth, async (req,res) => {
+    try {
+        const commIdUpper = req.params.commissionId.toUpperCase();
+        const c = await Commission.findOne({ commissionId: commIdUpper });
+        if (!c) return res.status(404).json({ message:'Commission not found.' });
+        if (c.status === 'Converted' && c.linkedOrderId) {
+            // Already converted (e.g. a duplicate verify call) — return the existing order rather than erroring or double-creating one.
+            const existing = await Order.findOne({ id: c.linkedOrderId });
+            return res.json({ success:true, order: existing });
+        }
+        if (c.status !== 'Accepted') return res.status(400).json({ message:'This commission is not awaiting payment.' });
+
+        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, address, guestEmail, guestPhone } = req.body;
+        const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+            .update(razorpay_order_id + '|' + razorpay_payment_id).digest('hex');
+        if (expected !== razorpay_signature) return res.status(400).json({ message:'Payment verification failed. Please contact support.' });
+        if (!address || !address.line1 || !address.city || !address.pin) return res.status(400).json({ message:'A delivery address is required.' });
+
+        const isGuest = !req.user;
+        if (isGuest) {
+            const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+            if (!guestEmail || !emailRx.test(String(guestEmail).trim().toLowerCase())) {
+                return res.status(400).json({ message:'A valid email is required.' });
+            }
+        }
+
+        // NEW: atomically claim the conversion before creating the order — same
+        // "conditional update only succeeds once" pattern already used for stock
+        // reservation in POST /api/orders. Without this, two near-simultaneous
+        // verify calls for the same commission (a network retry firing right
+        // after the original handler, for example) could both pass the status
+        // check above before either had written back, and each would go on to
+        // create its own separate Order for the same payment — a duplicate
+        // order, not a double Razorpay charge, but still wrong and confusing
+        // to reconcile. This update only matches (and succeeds) while status
+        // is still exactly 'Accepted', so only one of the two requests can win
+        // the race; the loser falls through to the "already converted" branch.
+        const claimed = await Commission.findOneAndUpdate(
+            { commissionId: commIdUpper, status: 'Accepted' },
+            { status: 'Converting' }, // transient marker, replaced with 'Converted'+linkedOrderId below
+            { new: true }
+        );
+        if (!claimed) {
+            // Lost the race (or status changed underneath us) — re-check: if a
+            // concurrent request already finished converting it, hand back that
+            // order instead of erroring out the customer on what was actually a success.
+            const recheck = await Commission.findOne({ commissionId: commIdUpper });
+            if (recheck && recheck.status === 'Converted' && recheck.linkedOrderId) {
+                const existing = await Order.findOne({ id: recheck.linkedOrderId });
+                return res.json({ success:true, order: existing });
+            }
+            return res.status(409).json({ message:'This commission is already being processed. Please refresh and try again.' });
+        }
+
+        const shipDaysSetting = await Settings.findOne({ key: 'shipping.days' });
+        const defaultDeliveryDays = shipDaysSetting ? parseInt(shipDaysSetting.value, 10) || 2 : 2;
+        const orderId = `DD-${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
+
+        let order;
+        try {
+            // NEW: a commission has no Product document behind it (it's bespoke,
+            // made to order), so its "items" entry is synthetic — just enough
+            // shape for the admin Orders table and customer order-history views
+            // to render something sensible, tagged isCommission so anything that
+            // wants to treat it specially (analytics, stock logic) can detect it
+            // and skip the usual product-stock handling entirely.
+            order = await Order.create({
+                userId: req.user ? req.user.id : null,
+                guestEmail: isGuest ? String(guestEmail).trim().toLowerCase() : '',
+                guestPhone: isGuest ? String(guestPhone || '').trim() : '',
+                isGuestOrder: isGuest,
+                id: orderId,
+                items: [{
+                    _id: 'commission-' + c.commissionId,
+                    name: `Custom Commission — ${c.type}`,
+                    price: c.quotedPrice,
+                    qty: 1,
+                    isCommission: true,
+                    commissionId: c.commissionId
+                }],
+                total: c.quotedPrice,
+                shipping: 0,
+                discount: 0,
+                coupon: null,
+                status: 'Placed',
+                date: new Date().toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }),
+                address,
+                payment: { method:'Online', txnId:razorpay_payment_id, razorpayOrderId:razorpay_order_id },
+                deliveryDays: defaultDeliveryDays
+            });
+        } catch (createErr) {
+            // Order creation failed after claiming the conversion slot — release
+            // the claim back to 'Accepted' so the customer (or a retry) can try
+            // again, rather than leaving the commission stuck in 'Converting' forever.
+            await Commission.findOneAndUpdate({ commissionId: commIdUpper, status: 'Converting' }, { status: 'Accepted' });
+            throw createErr;
+        }
+
+        claimed.status = 'Converted';
+        claimed.linkedOrderId = orderId;
+        await claimed.save();
+        if (req.user) await User.findByIdAndUpdate(req.user.id, { $inc:{ totalSpent:c.quotedPrice, orderCount:1 } });
+
+        sendMail(c.email, `Commission Confirmed & Order Placed — ${orderId} 🎉`, commissionConvertedEmail(c, order));
+        res.status(201).json({ success:true, order });
+    } catch (err) { console.error('[POST /commissions/:id/pay/verify]', err); res.status(500).json({ message:'Payment succeeded but we could not finalize your order — please contact support with your payment ID.' }); }
 });
 
 app.get('/api/user/commissions', auth, async (req,res) => {
@@ -795,7 +1058,8 @@ app.get('/api/user/commissions', auth, async (req,res) => {
         if (!user) return res.status(404).json({ message:'User not found' });
         const commissions = await Commission.find({ email: user.email })
             .sort({ createdAt:-1 })
-            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt');
+            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId');
+        await attachLinkedOrderStatus(commissions);
         res.json({ commissions });
     } catch { res.status(500).json({ message:'Error' }); }
 });
@@ -922,8 +1186,10 @@ function commissionConfirmEmail(c) {
 function commissionStatusEmail(c) {
     const statusMsg = {
         'Quoted':      { icon:'💰', title:'Your Quote is Ready!',     msg:`We've reviewed your project and prepared a quote for you.` },
+        'Accepted':    { icon:'✅', title:'Quote Accepted',            msg:'Thanks for accepting the quote! Complete payment to confirm your order.' },
         'In Progress': { icon:'🔨', title:'Work Has Begun!',          msg:'Great news — our team has started working on your commission!' },
         'Completed':   { icon:'🎉', title:'Your Commission is Ready!', msg:'Your custom piece is complete! We\'ll be in touch shortly.' },
+        'Converted':   { icon:'🎉', title:'Order Confirmed!',          msg:'Your payment was received — your commission is now a confirmed order.' },
         'Cancelled':   { icon:'❌', title:'Commission Cancelled',       msg:'Your commission has been cancelled.' },
     };
     const info = statusMsg[c.status] || { icon:'🔔', title:'Commission Update', msg:'Your commission status has been updated.' };
@@ -933,16 +1199,88 @@ function commissionStatusEmail(c) {
       <h2 style="font-family:Georgia,serif;font-size:1.8rem;color:#3D1A0E;margin:0 0 8px;">${info.title}</h2>
       <p style="color:rgba(61,26,14,0.55);margin:0;font-size:0.9rem;">${info.msg}</p>
     </div>
-    <div style="background:#F7EDE6;border-radius:16px;padding:20px 24px;margin-bottom:20px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
-        <div><div style="font-size:0.6rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;margin-bottom:4px;">Commission ID</div><div style="font-family:Georgia,serif;font-size:1.3rem;font-weight:700;color:#3D1A0E;">${c.commissionId}</div></div>
-        <div style="background:linear-gradient(135deg,#D4748C,#8B3252);color:white;border-radius:99px;padding:8px 18px;font-size:0.72rem;font-weight:800;letter-spacing:1px;">${c.status.toUpperCase()}</div>
-      </div>
-    </div>
+    <!-- FIXED: was display:flex justify-content:space-between — without flex
+         support the label and the status pill stacked on top of each other
+         instead of sitting on opposite ends of the row. A 2-column table
+         (left cell align=left, right cell align=right) is the standard
+         email-safe way to replicate "space-between" layout. -->
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#F7EDE6;border-radius:16px;margin-bottom:20px;">
+      <tr>
+        <td style="padding:20px 24px;" align="left"><div style="font-size:0.6rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;margin-bottom:4px;">Commission ID</div><div style="font-family:Georgia,serif;font-size:1.3rem;font-weight:700;color:#3D1A0E;">${c.commissionId}</div></td>
+        <td style="padding:20px 24px;" align="right" valign="top"><span style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;border-radius:99px;padding:8px 18px;font-size:0.72rem;font-weight:800;letter-spacing:1px;white-space:nowrap;">${c.status.toUpperCase()}</span></td>
+      </tr>
+    </table>
     ${c.quotedPrice?`<div style="background:white;border:2px dashed rgba(212,160,74,0.4);border-radius:14px;padding:16px 20px;margin-bottom:20px;text-align:center;"><div style="font-size:0.72rem;font-weight:800;color:rgba(61,26,14,0.45);margin-bottom:6px;">Quoted Price</div><div style="font-family:Georgia,serif;font-size:2rem;font-weight:700;color:#3D1A0E;">₹${c.quotedPrice.toLocaleString('en-IN')}</div></div>`:''}
     ${c.adminNote?`<div style="background:white;border-left:3px solid #D4748C;border-radius:0 14px 14px 0;padding:16px 20px;margin-bottom:20px;"><div style="font-size:0.6rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#D4748C;margin-bottom:8px;">📌 Message from Design Den</div><div style="font-size:0.85rem;color:rgba(61,26,14,0.7);line-height:1.65;">${c.adminNote}</div></div>`:''}
     <div style="text-align:center;margin-top:20px;">
       <a href="${STORE_URL}/#custom" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:13px 32px;border-radius:999px;font-weight:800;font-size:0.8rem;letter-spacing:2px;text-transform:uppercase;">Track Commission →</a>
+    </div>`)
+}
+
+// NEW: sent the moment a commission's payment is verified and a real Order is
+// created from it. Gives the customer their actual Order ID right away — from
+// this point forward they should think of (and track) this as an order, not a
+// commission, since it now flows through the same Placed → Delivered pipeline.
+function commissionConvertedEmail(c, order) {
+    return emailWrap(`
+    <div style="text-align:center;margin-bottom:28px;">
+      <div style="font-size:3rem;margin-bottom:12px;">🎉</div>
+      <h2 style="font-family:Georgia,serif;font-size:1.8rem;color:#3D1A0E;margin:0 0 8px;">Payment Received — Order Confirmed!</h2>
+      <p style="color:rgba(61,26,14,0.55);margin:0;font-size:0.9rem;">Your custom commission is now a confirmed order and will be tracked through to delivery.</p>
+    </div>
+    <!-- FIXED: was display:flex justify-content:space-between — see note in
+         commissionStatusEmail above; same table-based fix applied here. -->
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#F7EDE6;border-radius:16px;margin-bottom:20px;">
+      <tr>
+        <td style="padding:20px 24px 6px;" align="left"><div style="font-size:0.6rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;margin-bottom:4px;">Order ID</div><div style="font-family:Georgia,serif;font-size:1.3rem;font-weight:700;color:#3D1A0E;">${order.id}</div></td>
+        <td style="padding:20px 24px 6px;" align="right" valign="top"><span style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;border-radius:99px;padding:8px 18px;font-size:0.72rem;font-weight:800;letter-spacing:1px;white-space:nowrap;">PLACED</span></td>
+      </tr>
+      <tr>
+        <td colspan="2" style="padding:0 24px 20px;font-size:0.72rem;color:rgba(61,26,14,0.4);">From Commission ${c.commissionId} — ${c.type}</td>
+      </tr>
+    </table>
+    <div style="background:white;border:2px dashed rgba(212,160,74,0.4);border-radius:14px;padding:16px 20px;margin-bottom:20px;text-align:center;">
+      <div style="font-size:0.72rem;font-weight:800;color:rgba(61,26,14,0.45);margin-bottom:6px;">Amount Paid</div>
+      <div style="font-family:Georgia,serif;font-size:2rem;font-weight:700;color:#3D1A0E;">₹${order.total.toLocaleString('en-IN')}</div>
+    </div>
+    <div style="text-align:center;margin-top:20px;">
+      <a href="${STORE_URL}/#custom" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:13px 32px;border-radius:999px;font-weight:800;font-size:0.8rem;letter-spacing:2px;text-transform:uppercase;">Track Your Order →</a>
+    </div>`)
+}
+
+// NEW: order status emails. Previously order status changes (Placed →
+// Confirmed → Processing → Shipped → Out for Delivery → Delivered) updated
+// the database but never notified the customer — commissions had status
+// emails and regular orders didn't, which was an inconsistency worth fixing
+// while building out a proper tracked pipeline for converted commissions.
+// Sent from the admin order-status-update route whenever status actually changes.
+function orderStatusEmail(o) {
+    const statusMsg = {
+        'Confirmed':        { icon:'✅', title:'Order Confirmed!',       msg:'We\'ve confirmed your order and are getting it ready.' },
+        'Processing':       { icon:'🧶', title:'Your Order is Being Made!', msg:'Our artisans are working on your order right now.' },
+        'Shipped':          { icon:'📦', title:'Your Order Has Shipped!', msg:'Your order is on its way to you.' },
+        'Out for Delivery': { icon:'🚚', title:'Out for Delivery!',       msg:'Your order will arrive today — keep your phone handy.' },
+        'Delivered':        { icon:'🎉', title:'Delivered!',              msg:'Your order has been delivered. We hope you love it!' },
+        'Cancelled':        { icon:'❌', title:'Order Cancelled',         msg:'Your order has been cancelled.' },
+    };
+    const info = statusMsg[o.status] || { icon:'🔔', title:'Order Update', msg:'Your order status has been updated.' };
+    return emailWrap(`
+    <div style="text-align:center;margin-bottom:28px;">
+      <div style="font-size:3rem;margin-bottom:12px;">${info.icon}</div>
+      <h2 style="font-family:Georgia,serif;font-size:1.8rem;color:#3D1A0E;margin:0 0 8px;">${info.title}</h2>
+      <p style="color:rgba(61,26,14,0.55);margin:0;font-size:0.9rem;">${info.msg}</p>
+    </div>
+    <!-- FIXED: was display:flex justify-content:space-between — see note in
+         commissionStatusEmail above; same table-based fix applied here. -->
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#F7EDE6;border-radius:16px;margin-bottom:20px;">
+      <tr>
+        <td style="padding:20px 24px;" align="left"><div style="font-size:0.6rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;margin-bottom:4px;">Order ID</div><div style="font-family:Georgia,serif;font-size:1.3rem;font-weight:700;color:#3D1A0E;">${o.id}</div></td>
+        <td style="padding:20px 24px;" align="right" valign="top"><span style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;border-radius:99px;padding:8px 18px;font-size:0.72rem;font-weight:800;letter-spacing:1px;white-space:nowrap;">${o.status.toUpperCase()}</span></td>
+      </tr>
+    </table>
+    ${o.adminNote?`<div style="background:white;border-left:3px solid #D4748C;border-radius:0 14px 14px 0;padding:16px 20px;margin-bottom:20px;"><div style="font-size:0.6rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#D4748C;margin-bottom:8px;">📌 Note from Design Den</div><div style="font-size:0.85rem;color:rgba(61,26,14,0.7);line-height:1.65;">${o.adminNote}</div></div>`:''}
+    <div style="text-align:center;margin-top:20px;">
+      <a href="${STORE_URL}/#track" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:13px 32px;border-radius:999px;font-weight:800;font-size:0.8rem;letter-spacing:2px;text-transform:uppercase;">Track Your Order →</a>
     </div>`)
 }
 
@@ -1433,10 +1771,28 @@ app.put('/api/admin/orders/:id/status', adminAuth, async (req,res) => {
         const { status, adminNote, deliveryDays } = req.body; // Added deliveryDays override
         const update = { status };
         if (adminNote !== undefined) update.adminNote = adminNote;
-        if (deliveryDays !== undefined) update.deliveryDays = deliveryDays; 
-        
+        if (deliveryDays !== undefined) update.deliveryDays = deliveryDays;
+
+        const prev = await Order.findOne({ id:req.params.id }).select('status guestEmail userId');
+        if (!prev) return res.status(404).json({ message:'Order not found' });
+
         const order = await Order.findOneAndUpdate({ id:req.params.id }, update, { new:true });
-        if (!order) return res.status(404).json({ message:'Order not found' });
+
+        // NEW: notify the customer on status change — previously this route
+        // silently updated the DB with no email at all, the one inconsistency
+        // left over from before commissions could become real orders (those
+        // already got status emails; plain orders never did). Resolves to the
+        // account email for logged-in customers, or guestEmail for guest
+        // checkouts — same lookup pattern used everywhere else in this file.
+        if (status && status !== prev.status) {
+            let toEmail = order.guestEmail;
+            if (!toEmail && prev.userId) {
+                const u = await User.findById(prev.userId).select('email');
+                toEmail = u && u.email;
+            }
+            if (toEmail) sendMail(toEmail, `Order Update — ${order.id} (${order.status}) 🧶`, orderStatusEmail(order));
+        }
+
         res.json({ order });
     } catch { res.status(500).json({ message:'Failed to update order' }); }
 });
@@ -1498,6 +1854,15 @@ app.put('/api/admin/commissions/:id', adminAuth, async (req,res) => {
     try {
         const prev = await Commission.findById(req.params.id);
         if (!prev) return res.status(404).json({ message:'Not found' });
+        // NEW: once a commission is Converted, it has a real linked Order whose
+        // own status is the source of truth from here on — the admin panel
+        // already locks status/quotedPrice editing in this state (see
+        // viewCommission in admin.html), and this mirrors that server-side so
+        // a direct API call can't silently re-open or re-quote a paid
+        // commission and send a misleading status email about it.
+        if (prev.status === 'Converted' && (req.body.status !== undefined || req.body.quotedPrice !== undefined)) {
+            return res.status(400).json({ message:'This commission has already been paid for and converted into an order — update the linked order instead.' });
+        }
         const update = { ...req.body };
         if (update.status === 'Completed' && !prev.completedAt) update.completedAt = new Date();
         const c = await Commission.findByIdAndUpdate(req.params.id, update, { new:true, runValidators:true });
@@ -1540,6 +1905,22 @@ app.get('/api/admin/email-log', adminAuth, async (req,res) => {
         const failedCount = await EmailLog.countDocuments({ status:'failed' });
         res.json({ logs, failedCount });
     } catch { res.status(500).json({ message:'Failed to fetch email log' }); }
+});
+
+// NEW: lets the admin panel show "is email actually working right now"
+// directly — configured/not, last verify result, which transport (Gmail vs
+// custom SMTP) and which address it's sending from — rather than the admin
+// only finding out indirectly from a rising failed-send count with no
+// detail on WHY every send is failing (wrong password, wrong host, etc).
+app.get('/api/admin/email-transport-status', adminAuth, async (req,res) => {
+    res.json({
+        configured: mailerStatus.configured,
+        ok: mailerStatus.ok,
+        error: mailerStatus.error,
+        checkedAt: mailerStatus.checkedAt,
+        transport: mailerStatus.transport,
+        fromAddress: mailerStatus.configured ? EMAIL_FROM_ADDRESS : null
+    });
 });
 
 // ── Admin settings ────────────────────────────────────────────────────────────
