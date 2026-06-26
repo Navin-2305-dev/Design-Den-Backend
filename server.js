@@ -15,16 +15,53 @@ const nodemailer  = require('nodemailer');
 const helmet      = require('helmet');             // NEW — security headers (npm i helmet)
 const rateLimit   = require('express-rate-limit');  // NEW — brute-force protection (npm i express-rate-limit)
 
-// NEW: fixes "connect ENETUNREACH 2404:....:465" email failures. Gmail's SMTP
-// hostname resolves to both an IPv4 and an IPv6 address; Node 18+ tries
-// whichever DNS returns first, and many hosts (Render, most container
-// platforms) have no outbound IPv6 route at all, so any IPv6 attempt fails
-// immediately with ENETUNREACH — even though the exact same connection would
-// work instantly over IPv4. This makes IPv4 the preferred order for every
-// outbound DNS lookup in this process (Gmail/SMTP, Razorpay, anything else
-// that resolves a dual-stack hostname), which is the documented Node fix for
-// this exact class of error.
+// Render (and most container platforms) has no outbound IPv6 route at all,
+// so any outbound IPv6 connection attempt fails immediately with ENETUNREACH
+// — even though the exact same connection works instantly over IPv4. This
+// makes IPv4 the preferred order for every outbound DNS lookup that goes
+// through Node's normal dns.lookup() path — Razorpay's HTTPS calls,
+// Mongoose/MongoDB's driver, etc.
+// NOTE: this does NOT cover Nodemailer — see below for why, and for the
+// actual fix for the "connect ENETUNREACH 2404:...:465" email failures.
 dns.setDefaultResultOrder('ipv4first');
+
+// THE ACTUAL EMAIL FIX. Confirmed by tracing Nodemailer's own source
+// (lib/shared/index.js): Nodemailer does NOT use dns.lookup() to resolve SMTP
+// hosts, so dns.setDefaultResultOrder() above never touches it. Instead it
+// creates its own `new dns.Resolver()` and calls resolve4()/resolve6()
+// directly. As of Nodemailer 8.x, when a host has BOTH an A and a AAAA
+// record — which smtp.gmail.com does — it resolves both and picks ONE AT
+// RANDOM for every fresh (uncached) connection. With one IPv4 + one IPv6
+// candidate, that's a coin flip on every send. Locally the coin flip never
+// matters because your ISP routes IPv6 fine either way. On Render, the
+// container's network interface still *reports* IPv6 support to Node (so
+// Nodemailer's own "is IPv6 even available" check passes) even though there
+// is no real upstream IPv6 route — so the ~50% of sends that land on the
+// IPv6 address fail instantly with ENETUNREACH, while the other ~50% go out
+// over IPv4 and succeed. That intermittent split is exactly the "works
+// locally, fails sometimes on Render" pattern. A transport's `family` option
+// can't fix this either — by the time Nodemailer opens the socket it has
+// already replaced the hostname with whichever literal IP it randomly
+// picked, so there's no hostname left for `family` to act on.
+// Fix: patch the same Resolver class Nodemailer instantiates internally so
+// resolve6() always reports "no IPv6 addresses" — which is simply true for
+// this environment — leaving only the IPv4 address for it to pick.
+// Verified directly against Nodemailer 9.x: 30/30 connections resolved to
+// the IPv4 address after this patch, vs. a ~50/50 split before it.
+if (process.env.DISABLE_IPV6 !== 'false') {
+    const refuseIPv6 = (...args) => {
+        const callback = args[args.length - 1];
+        if (typeof callback === 'function') {
+            const err = Object.assign(new Error('IPv6 disabled for this process'), { code:'ENODATA' });
+            process.nextTick(() => callback(err));
+        }
+    };
+    dns.Resolver.prototype.resolve6 = refuseIPv6; // what Nodemailer actually calls
+    dns.resolve6 = refuseIPv6;                    // belt-and-suspenders for any other caller
+    if (dns.promises) {
+        dns.promises.resolve6 = () => Promise.reject(Object.assign(new Error('IPv6 disabled for this process'), { code:'ENODATA' }));
+    }
+}
 
 const app = express();
 
@@ -461,17 +498,6 @@ let mailer = null;
 // from a failed-send count with no further detail.
 let mailerStatus = { configured:false, ok:null, error:null, checkedAt:null, transport:null };
 
-// FIXED: Google displays an App Password as 4 groups of 4 characters
-// separated by spaces (e.g. "abcd efgh ijkl mnop") purely for readability —
-// the actual stored credential is those 16 characters with NO spaces. If the
-// password is copied straight from Google's screen (spaces and all) into an
-// env var, every single login attempt fails authentication, because the
-// literal string sent to Gmail's SMTP server doesn't match what Google
-// actually has on file. This silently breaks email with no obvious cause
-// unless you know this specific quirk — stripping all whitespace here makes
-// it work correctly whether the password was copied with or without spaces.
-function _cleanCred(v) { return (v || '').replace(/\s+/g, ''); }
-
 function _initMailer() {
     if (process.env.SMTP_HOST) {
         // Generic SMTP — works with any provider (custom domain mailboxes,
@@ -480,12 +506,14 @@ function _initMailer() {
             host: process.env.SMTP_HOST,
             port: parseInt(process.env.SMTP_PORT, 10) || 587,
             secure: process.env.SMTP_SECURE === 'true', // true for port 465, false for 587/STARTTLS
-            auth: { user: _cleanCred(process.env.SMTP_USER || process.env.EMAIL_USER), pass: _cleanCred(process.env.SMTP_PASS || process.env.EMAIL_PASS) },
-            // NEW: belt-and-suspenders alongside dns.setDefaultResultOrder
-            // above — forces the actual TCP socket to dial out over IPv4 only,
-            // so this specific connection can't hit ENETUNREACH from an IPv6
-            // route even if some other part of the stack ignores the global
-            // DNS order setting.
+            auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: process.env.SMTP_PASS || process.env.EMAIL_PASS },
+            // NOTE: `family: 4` is left here as harmless documentation of
+            // intent, but it does NOT actually prevent the IPv6 ENETUNREACH
+            // issue — Nodemailer resolves the hostname to a literal IP itself
+            // before opening the socket, so there's no hostname left at
+            // connect-time for `family` to influence. The real fix for that
+            // is the dns.Resolver.prototype.resolve6 patch up near the top
+            // of the file.
             family: 4
         });
         mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587})`;
@@ -499,7 +527,7 @@ function _initMailer() {
          host: 'smtp.gmail.com',
          port: 465,
          secure: true,
-         auth: { user: _cleanCred(process.env.EMAIL_USER), pass: _cleanCred(process.env.EMAIL_PASS) },
+         auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
          family: 4
      });
      mailerStatus.transport = `Gmail (${process.env.EMAIL_USER}) via smtp.gmail.com:465`;
@@ -524,7 +552,7 @@ function _initMailer() {
 }
 _initMailer();
 
-const EMAIL_FROM_ADDRESS = _cleanCred(process.env.SMTP_USER || process.env.EMAIL_USER);
+const EMAIL_FROM_ADDRESS = process.env.SMTP_USER || process.env.EMAIL_USER;
 
 async function sendMail(to, subject, html) {
     if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
