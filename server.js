@@ -465,33 +465,41 @@ function _initMailer() {
     if (process.env.SMTP_HOST) {
         // Generic SMTP — works with any provider (custom domain mailboxes,
         // SES, SendGrid, Mailgun, Postmark, Zoho, Outlook/Office365, etc).
+        // FIX: Gmail App Passwords are displayed with spaces (e.g. "btnt ddjo ppzc tavj")
+        // for readability but must be passed without spaces to SMTP auth.
+        // Stripping here makes both formats work regardless of how the env var is set.
+        const smtpPass = (process.env.SMTP_PASS || process.env.EMAIL_PASS || '').replace(/\s+/g, '');
         mailer = nodemailer.createTransport({
             host: process.env.SMTP_HOST,
             port: parseInt(process.env.SMTP_PORT, 10) || 587,
             secure: process.env.SMTP_SECURE === 'true', // true for port 465, false for 587/STARTTLS
-            auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: process.env.SMTP_PASS || process.env.EMAIL_PASS },
-            // NEW: belt-and-suspenders alongside dns.setDefaultResultOrder
-            // above — forces the actual TCP socket to dial out over IPv4 only,
-            // so this specific connection can't hit ENETUNREACH from an IPv6
-            // route even if some other part of the stack ignores the global
-            // DNS order setting.
-            family: 4
+            auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: smtpPass },
+            // Forces the actual TCP socket to dial out over IPv4 only,
+            // so this connection can't hit ENETUNREACH from an IPv6 route
+            // even if the global dns.setDefaultResultOrder setting is ignored.
+            family: 4,
+            // FIX: explicit TLS options — without this, some hosting platforms
+            // (Render, Railway, etc.) fail Gmail SMTP with a TLS handshake error
+            // even though the credentials and port are correct.
+            tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' }
         });
         mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587})`;
     } else if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
-        // Backward-compatible default: Gmail service shorthand. Requires an
-        // App Password (not a regular account password) when 2FA is on,
-        // which Google effectively requires for SMTP access now — using a
-        // regular password is one of the most common causes of every send
-        // failing with an auth error.
+        // Backward-compatible default: Gmail direct SMTP. Requires a 16-character
+        // App Password (not your regular account password) — Google enforces this
+        // when 2FA is enabled, which is effectively required for all accounts now.
+        // FIX: strip spaces from App Password (Google shows them with spaces for
+        // readability, e.g. "btnt ddjo ppzc tavj", but they must be removed for auth).
+        const gmailPass = process.env.EMAIL_PASS.replace(/\s+/g, '');
         mailer = nodemailer.createTransport({
-         host: 'smtp.gmail.com',
-         port: 465,
-         secure: true,
-         auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
-         family: 4
-     });
-     mailerStatus.transport = `Gmail (${process.env.EMAIL_USER}) via smtp.gmail.com:465`;
+            host: 'smtp.gmail.com',
+            port: 465,
+            secure: true,
+            auth: { user: process.env.EMAIL_USER, pass: gmailPass },
+            family: 4,
+            tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' }
+        });
+        mailerStatus.transport = `Gmail (${process.env.EMAIL_USER}) via smtp.gmail.com:465`;
     } else {
         console.warn('⚠️  No email transport configured — set EMAIL_USER/EMAIL_PASS (Gmail) or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS (any provider) to enable emails.');
         mailerStatus = { configured:false, ok:false, error:'No EMAIL_USER/EMAIL_PASS or SMTP_HOST configured.', checkedAt:new Date(), transport:null };
@@ -1427,6 +1435,73 @@ function orderStatusEmail(o) {
     </div>`)
 }
 
+// NEW: sent immediately when an order is placed (for both logged-in users and
+// guests). Previously the server created the order and returned 201 with no
+// email at all — the customer had no paper trail until the admin manually
+// changed the status. This gives them an instant receipt with order ID, items,
+// totals, and a link to track, matching the same moment in every other flow
+// (commission submit, pattern purchase, welcome) that already sends right away.
+function orderConfirmEmail(order, customerName) {
+    const isCOD = order.payment && order.payment.method === 'Cash on Delivery';
+    const itemRows = Array.isArray(order.items) ? order.items.map(item => {
+        const variantLabel = item.variantLabel ? ` — ${item.variantLabel}` : '';
+        return `<tr>
+          <td style="padding:10px 0;border-bottom:1px solid rgba(212,116,140,0.1);font-size:0.82rem;color:#3D1A0E;">${item.name||'Item'}${variantLabel}</td>
+          <td style="padding:10px 0;border-bottom:1px solid rgba(212,116,140,0.1);font-size:0.82rem;color:rgba(61,26,14,0.55);text-align:center;">${item.qty||1}</td>
+          <td style="padding:10px 0;border-bottom:1px solid rgba(212,116,140,0.1);font-size:0.82rem;color:#3D1A0E;text-align:right;">₹${((item.price||0)*(item.qty||1)).toLocaleString('en-IN')}</td>
+        </tr>`;
+    }).join('') : '';
+
+    return emailWrap(`
+    <div style="text-align:center;margin-bottom:28px;">
+      <div style="font-size:3rem;margin-bottom:12px;">🎉</div>
+      <h2 style="font-family:Georgia,serif;font-size:1.8rem;color:#3D1A0E;margin:0 0 8px;">Order Placed Successfully!</h2>
+      <p style="color:rgba(61,26,14,0.55);margin:0;font-size:0.9rem;">${customerName ? `Hi ${customerName}! ` : ''}Thank you for your order — we're on it! 🧶</p>
+    </div>
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#F7EDE6;border-radius:16px;margin-bottom:20px;">
+      <tr>
+        <td style="padding:20px 24px;" align="left">
+          <div style="font-size:0.6rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;margin-bottom:4px;">Order ID</div>
+          <div style="font-family:Georgia,serif;font-size:1.3rem;font-weight:700;color:#3D1A0E;">${order.id}</div>
+          <div style="font-size:0.72rem;color:rgba(61,26,14,0.4);margin-top:4px;">${order.date || ''}</div>
+        </td>
+        <td style="padding:20px 24px;" align="right" valign="top">
+          <span style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;border-radius:99px;padding:8px 18px;font-size:0.72rem;font-weight:800;letter-spacing:1px;white-space:nowrap;">PLACED ✓</span>
+        </td>
+      </tr>
+    </table>
+
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:20px;">
+      <tr>
+        <th style="padding:0 0 8px;font-size:0.65rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:rgba(61,26,14,0.4);text-align:left;">Item</th>
+        <th style="padding:0 0 8px;font-size:0.65rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:rgba(61,26,14,0.4);text-align:center;">Qty</th>
+        <th style="padding:0 0 8px;font-size:0.65rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:rgba(61,26,14,0.4);text-align:right;">Price</th>
+      </tr>
+      ${itemRows}
+    </table>
+
+    <div style="background:#F7EDE6;border-radius:14px;padding:16px 20px;margin-bottom:24px;">
+      ${order.discount > 0 ? `<div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="font-size:0.8rem;color:rgba(61,26,14,0.55);">Subtotal</span><span style="font-size:0.8rem;color:#3D1A0E;">₹${(order.total + order.discount - order.shipping).toLocaleString('en-IN')}</span></div><div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="font-size:0.8rem;color:#7DAA8A;">Discount</span><span style="font-size:0.8rem;color:#7DAA8A;">−₹${order.discount.toLocaleString('en-IN')}</span></div>` : ''}
+      <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="font-size:0.8rem;color:rgba(61,26,14,0.55);">Shipping</span><span style="font-size:0.8rem;color:#3D1A0E;">${order.shipping > 0 ? `₹${order.shipping.toLocaleString('en-IN')}` : 'FREE 🎁'}</span></div>
+      <div style="border-top:1px solid rgba(212,116,140,0.2);margin-top:8px;padding-top:8px;display:flex;justify-content:space-between;"><span style="font-size:0.95rem;font-weight:800;color:#3D1A0E;">Total</span><span style="font-family:Georgia,serif;font-size:1.1rem;font-weight:700;color:#3D1A0E;">₹${order.total.toLocaleString('en-IN')}</span></div>
+      ${isCOD ? `<div style="margin-top:10px;padding:8px 12px;background:rgba(212,116,140,0.1);border-radius:8px;font-size:0.75rem;color:rgba(61,26,14,0.6);text-align:center;">💵 Cash on Delivery — please keep ₹${order.total.toLocaleString('en-IN')} ready at the time of delivery.</div>` : `<div style="margin-top:10px;padding:8px 12px;background:rgba(125,170,138,0.12);border-radius:8px;font-size:0.75rem;color:rgba(61,26,14,0.6);text-align:center;">✅ Payment received online</div>`}
+    </div>
+
+    ${order.address ? `<div style="border:1.5px dashed rgba(212,116,140,0.3);border-radius:14px;padding:16px 20px;margin-bottom:24px;">
+      <div style="font-size:0.6rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#D4748C;margin-bottom:8px;">📍 Delivery Address</div>
+      <div style="font-size:0.82rem;color:#3D1A0E;line-height:1.7;">${order.address.name||''}<br>${order.address.line1||''}${order.address.line2 ? ', '+order.address.line2 : ''}<br>${order.address.city||''}${order.address.state ? ', '+order.address.state : ''}${order.address.pin ? ' — '+order.address.pin : ''}</div>
+    </div>` : ''}
+
+    <div style="text-align:center;margin-bottom:28px;">
+      <a href="${STORE_URL}/#track" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:14px 36px;border-radius:999px;font-weight:800;font-size:0.82rem;letter-spacing:2px;text-transform:uppercase;box-shadow:0 8px 24px rgba(139,50,82,0.25);">TRACK YOUR ORDER →</a>
+      <div style="font-size:0.68rem;color:rgba(61,26,14,0.35);margin-top:8px;">Use your Order ID: <strong>${order.id}</strong></div>
+    </div>
+    <div style="text-align:center;padding-top:20px;border-top:1px solid rgba(212,116,140,0.1);">
+      <p style="font-size:0.82rem;color:rgba(61,26,14,0.55);margin:0 0 4px;">With yarn love,</p>
+      <p style="font-family:Georgia,serif;font-size:1.1rem;font-weight:700;color:#D4748C;margin:0;">— The Design Den Team 🧶</p>
+    </div>`);
+}
+
 // Coupon validate (public)
 app.post('/api/coupons/validate', async (req,res) => {
     try {
@@ -1442,8 +1517,28 @@ app.post('/api/coupons/validate', async (req,res) => {
     } catch { res.status(500).json({ valid:false, message:'Server error' }); }
 });
 
-// Public settings
+// Newsletter subscribe (public)
+// FIX: the Subscriber model was defined and registered but had no matching API
+// route — any frontend "subscribe" button was silently doing nothing. Added here.
+app.post('/api/subscribe', async (req,res) => {
+    try {
+        const { email } = req.body;
+        const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+        if (!email || !emailRx.test(email.trim().toLowerCase())) {
+            return res.status(400).json({ message:'Please enter a valid email address' });
+        }
+        const normalised = email.trim().toLowerCase();
+        const existing = await Subscriber.findOne({ email: normalised });
+        if (existing) return res.status(409).json({ message:'You\'re already subscribed — thanks!' });
+        await Subscriber.create({ email: normalised });
+        res.status(201).json({ success:true });
+    } catch(err) {
+        console.error('[POST /subscribe]', err);
+        res.status(500).json({ message:'Subscription failed — please try again.' });
+    }
+});
 
+// Public settings
 app.get('/api/settings/public', async (_,res) => {
     try {
         const keys = ['store.name','store.tagline','store.whatsapp','store.instagram','shipping.freeAbove','shipping.fee','shipping.days','shipping.cod','marquee.items'];
@@ -1744,8 +1839,28 @@ app.post('/api/orders', optionalAuth, async (req,res) => {
         }
 
         if (appliedCoupon) await Coupon.findOneAndUpdate({ code:appliedCoupon },{ $inc:{ usedCount:1 } });
-        // NEW: only registered accounts accumulate totalSpent/orderCount — guests have no User document
+        // only registered accounts accumulate totalSpent/orderCount — guests have no User document
         if (req.user) await User.findByIdAndUpdate(req.user.id, { $inc:{ totalSpent:total, orderCount:1 } });
+
+        // FIX: send order confirmation email immediately — previously no email
+        // was sent at all when an order was placed, leaving customers with no
+        // receipt or paper trail until the admin manually changed the status.
+        // Guest orders: use guestEmail. Logged-in orders: look up the user's email.
+        try {
+            let toEmail = isGuest ? order.guestEmail : null;
+            let customerName = null;
+            if (!isGuest && req.user) {
+                const u = await User.findById(req.user.id).select('email name');
+                if (u) { toEmail = u.email; customerName = u.name; }
+            }
+            if (toEmail) {
+                sendMail(toEmail, `Order Confirmed — ${order.id} 🧶`, orderConfirmEmail(order, customerName));
+            }
+        } catch (emailErr) {
+            // Email failure must never block the order response — the order is
+            // already saved; a failed confirmation is logged but doesn't undo anything.
+            console.warn('[POST /orders] confirmation email error:', emailErr.message);
+        }
 
         res.status(201).json({ order });
     } catch(err) {
