@@ -15,16 +15,37 @@ const nodemailer  = require('nodemailer');
 const helmet      = require('helmet');             // NEW — security headers (npm i helmet)
 const rateLimit   = require('express-rate-limit');  // NEW — brute-force protection (npm i express-rate-limit)
 
-// NEW: fixes "connect ENETUNREACH 2404:....:465" email failures. Gmail's SMTP
-// hostname resolves to both an IPv4 and an IPv6 address; Node 18+ tries
-// whichever DNS returns first, and many hosts (Render, most container
-// platforms) have no outbound IPv6 route at all, so any IPv6 attempt fails
-// immediately with ENETUNREACH — even though the exact same connection would
-// work instantly over IPv4. This makes IPv4 the preferred order for every
-// outbound DNS lookup in this process (Gmail/SMTP, Razorpay, anything else
-// that resolves a dual-stack hostname), which is the documented Node fix for
-// this exact class of error.
+// FIX: "connect ENETUNREACH 2404:...:465" / "Local (:::0)" means Node chose
+// the IPv6 address that Gmail's SMTP hostname dual-stacks on, but the hosting
+// platform (Render, Railway, Fly, etc.) has no outbound IPv6 route.
+//
+// dns.setDefaultResultOrder('ipv4first') only SORTS the results — it does NOT
+// prevent Node from returning AAAA records, so on platforms where the IPv6
+// socket is created first (:::0), the connection still goes to the IPv6 address
+// and fails.  family:4 in nodemailer is similarly unreliable across versions.
+//
+// Two-layer fix:
+//   1. setDefaultResultOrder('ipv4first') — process-wide preference (keeps
+//      working for Razorpay, Mongo, and any other outbound connection).
+//   2. _resolveIPv4 lookup override passed directly into every nodemailer
+//      transport — calls dns.resolve4() so only A records are ever returned
+//      to nodemailer's internal net.createConnection, making it impossible for
+//      an IPv6 socket to be opened regardless of platform DNS behaviour.
 dns.setDefaultResultOrder('ipv4first');
+
+function _resolveIPv4(hostname, _opts, callback) {
+    // Some callers pass (hostname, callback) with no options object.
+    if (typeof _opts === 'function') { callback = _opts; }
+    dns.resolve4(hostname, (err, addrs) => {
+        if (!err && addrs && addrs.length) {
+            // dns.resolve4 succeeded — return the first IPv4 address.
+            return callback(null, addrs[0], 4);
+        }
+        // Fallback: resolve4 failed (CNAME-only host, custom provider, etc.)
+        // — fall back to the OS resolver but still pin family to 4.
+        dns.lookup(hostname, { family: 4 }, callback);
+    });
+}
 
 const app = express();
 
@@ -474,13 +495,16 @@ function _initMailer() {
             port: parseInt(process.env.SMTP_PORT, 10) || 587,
             secure: process.env.SMTP_SECURE === 'true', // true for port 465, false for 587/STARTTLS
             auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: smtpPass },
-            // Forces the actual TCP socket to dial out over IPv4 only,
-            // so this connection can't hit ENETUNREACH from an IPv6 route
-            // even if the global dns.setDefaultResultOrder setting is ignored.
+            // _resolveIPv4 is the real IPv6 fix — see comment above. family:4 is
+            // kept as a belt-and-suspenders hint but lookup is what actually works.
             family: 4,
-            // FIX: explicit TLS options — without this, some hosting platforms
-            // (Render, Railway, etc.) fail Gmail SMTP with a TLS handshake error
-            // even though the credentials and port are correct.
+            lookup: _resolveIPv4,
+            // Explicit timeouts so a blocked/unreachable host fails fast with a
+            // clear error instead of hanging for 2+ minutes and then timing out
+            // with no useful message in the logs.
+            connectionTimeout: 10000, // 10 s to establish TCP connection
+            greetingTimeout:   10000, // 10 s to receive SMTP greeting (220 banner)
+            socketTimeout:     15000, // 15 s of inactivity before giving up
             tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' }
         });
         mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587})`;
@@ -497,6 +521,10 @@ function _initMailer() {
             secure: true,
             auth: { user: process.env.EMAIL_USER, pass: gmailPass },
             family: 4,
+            lookup: _resolveIPv4,
+            connectionTimeout: 10000,
+            greetingTimeout:   10000,
+            socketTimeout:     15000,
             tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' }
         });
         mailerStatus.transport = `Gmail (${process.env.EMAIL_USER}) via smtp.gmail.com:465`;
