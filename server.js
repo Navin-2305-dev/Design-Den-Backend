@@ -339,84 +339,59 @@ const razorpay = new Razorpay({ key_id:process.env.RAZORPAY_KEY_ID||'rzp_test_pl
 // ─── Email transporter ────────────────────────────────────────────────────────
 // Since all DNS lookups are now forced to IPv4 (see top of file), nodemailer
 // will never attempt an IPv6 connection. No custom lookup hack is needed.
+
+const sgTransport = require('nodemailer-sendgrid-transport');
+
 let mailer = null;
-let mailerStatus = { configured:false, ok:null, error:null, checkedAt:null, transport:null };
+let mailerStatus = { configured: false, ok: null, error: null, checkedAt: null, transport: null };
 
 function _initMailer() {
-    // ── Helper: resolve hostname to IPv4 address ────────────────────────
-    async function resolveIPv4(hostname) {
-        try {
-            const addrs = await resolve4(hostname);
-            if (addrs && addrs.length) return addrs[0];   // first IPv4
-        } catch {
-            // fallback to hostname if resolution fails
-        }
-        return hostname;
+    if (!process.env.SENDGRID_API_KEY) {
+        console.warn('⚠️  SENDGRID_API_KEY not set – emails disabled.');
+        mailerStatus = { configured:false, ok:false, error:'SENDGRID_API_KEY missing', checkedAt:new Date(), transport:null };
+        return;
     }
 
-    (async () => {
-        if (process.env.SMTP_HOST) {
-            const ip = await resolveIPv4(process.env.SMTP_HOST);
-            const smtpPass = (process.env.SMTP_PASS || process.env.EMAIL_PASS || '').replace(/\s+/g, '');
-            mailer = nodemailer.createTransport({
-                host: ip,                          // ← raw IPv4 address
-                port: parseInt(process.env.SMTP_PORT, 10) || 587,
-                secure: process.env.SMTP_SECURE === 'true',
-                auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: smtpPass },
-                connectionTimeout: 10000,
-                greetingTimeout:   10000,
-                socketTimeout:     15000,
-                tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' }
-            });
-            mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587}) [IPv4: ${ip}]`;
-        } else if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
-            const ip = await resolveIPv4('smtp.gmail.com');
-            const gmailPass = process.env.EMAIL_PASS.replace(/\s+/g, '');
-            mailer = nodemailer.createTransport({
-                host: ip,
-                port: 465,
-                secure: true,
-                auth: { user: process.env.EMAIL_USER, pass: gmailPass },
-                connectionTimeout: 10000,
-                greetingTimeout:   10000,
-                socketTimeout:     15000,
-                tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' }
-            });
-            mailerStatus.transport = `Gmail (${process.env.EMAIL_USER}) via smtp.gmail.com:465 [IPv4: ${ip}]`;
-        } else {
-            console.warn('⚠️  No email transport configured – set EMAIL_USER/EMAIL_PASS (Gmail) or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS (any provider) to enable emails.');
-            mailerStatus = { configured:false, ok:false, error:'No EMAIL_USER/EMAIL_PASS or SMTP_HOST configured.', checkedAt:new Date(), transport:null };
-            return;
-        }
+    mailer = nodemailer.createTransport(sgTransport({
+        auth: { api_key: process.env.SENDGRID_API_KEY }
+    }));
+    mailerStatus.configured = true;
+    mailerStatus.transport = 'SendGrid (HTTPS API)';
 
-        mailerStatus.configured = true;
-        mailer.verify(err => {
-            mailerStatus.checkedAt = new Date();
-            if (err) {
-                mailerStatus.ok = false;
-                mailerStatus.error = err.message;
-                console.warn('⚠️  Email transport error:', err.message);
-            } else {
-                mailerStatus.ok = true;
-                mailerStatus.error = null;
-                console.log('✅ Email ready —', mailerStatus.transport);
-            }
-        });
-    })();
+    mailer.verify(err => {
+        mailerStatus.checkedAt = new Date();
+        if (err) {
+            mailerStatus.ok = false;
+            mailerStatus.error = err.message;
+            console.warn('⚠️  Email transport error:', err.message);
+        } else {
+            mailerStatus.ok = true;
+            mailerStatus.error = null;
+            console.log('✅ Email ready – SendGrid via HTTPS');
+        }
+    });
 }
 _initMailer();
 
-const EMAIL_FROM_ADDRESS = process.env.SMTP_USER || process.env.EMAIL_USER;
+const EMAIL_FROM_ADDRESS = process.env.EMAIL_FROM || 'noreply@design-den-studio.vercel.app';
 
 async function sendMail(to, subject, html) {
-    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured' }).catch(()=>{}); return; }
+    if (!mailer) {
+        await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (SENDGRID_API_KEY missing)' }).catch(()=>{});
+        return;
+    }
     try {
-        await mailer.sendMail({ from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html });
+        await mailer.sendMail({
+            from: `"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`,
+            to,
+            subject,
+            html
+        });
         console.log(`📧 Email sent to ${to}`);
         await EmailLog.create({ to, subject, status:'sent' }).catch(()=>{});
-    } catch(err) {
+    } catch (err) {
         console.warn(`⚠️  Email to ${to} failed:`, err.message);
-        await EmailLog.create({ to, subject, status:'failed', error:err.message }).catch(()=>{});
+        await EmailLog.create({ to, subject, status:'failed', error: err.message }).catch(()=>{});
     }
 }
 
