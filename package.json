@@ -16,6 +16,7 @@
     "helmet": "^8.2.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.4.0",
+    "nodemailer": "^9.0.1",
     "razorpay": "^2.9.2",
     "twilio": "^5.2.0"
   },
