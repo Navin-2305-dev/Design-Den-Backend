@@ -3,6 +3,7 @@
 // ║  Node.js + Express + MongoDB + Razorpay + Nodemailer                     ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 require('dotenv').config();
+const dns         = require('dns');
 const express     = require('express');
 const mongoose    = require('mongoose');
 const bcrypt      = require('bcryptjs');
@@ -13,6 +14,17 @@ const crypto      = require('crypto');
 const nodemailer  = require('nodemailer');
 const helmet      = require('helmet');             // NEW — security headers (npm i helmet)
 const rateLimit   = require('express-rate-limit');  // NEW — brute-force protection (npm i express-rate-limit)
+
+// NEW: fixes "connect ENETUNREACH 2404:....:465" email failures. Gmail's SMTP
+// hostname resolves to both an IPv4 and an IPv6 address; Node 18+ tries
+// whichever DNS returns first, and many hosts (Render, most container
+// platforms) have no outbound IPv6 route at all, so any IPv6 attempt fails
+// immediately with ENETUNREACH — even though the exact same connection would
+// work instantly over IPv4. This makes IPv4 the preferred order for every
+// outbound DNS lookup in this process (Gmail/SMTP, Razorpay, anything else
+// that resolves a dual-stack hostname), which is the documented Node fix for
+// this exact class of error.
+dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
 
@@ -44,6 +56,12 @@ const EXTRA_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map
 // would link customers to a localhost address if this env var were ever
 // unset on Render. Falls back to the real production frontend instead.
 const STORE_URL = (process.env.STORE_URL || 'https://design-den-studio.vercel.app').replace(/\/+$/, '');
+// NEW: where to email the shop owner when a customer counter-proposes a
+// commission price (the admin already sees everything in the panel, but an
+// email means they don't have to keep checking back). Optional — if unset,
+// negotiation emails to the admin are silently skipped rather than erroring,
+// same graceful-degradation pattern used elsewhere for optional config.
+const ADMIN_NOTIFY_EMAIL = process.env.ADMIN_NOTIFY_EMAIL || '';
 // Normalize away trailing slashes — "https://x.vercel.app/" and
 // "https://x.vercel.app" are the same origin to a browser but NOT the same
 // string, and a same-string check is exactly what was silently breaking this
@@ -348,6 +366,30 @@ const commissionSchema = new mongoose.Schema({
     // pipeline every regular product order already goes through.
     status:       { type:String, default:'New', enum:['New','Quoted','Accepted','Converting','In Progress','Completed','Converted','Cancelled'] },
     quotedPrice:  { type:Number, default:null },
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NEGOTIATION — dual-approval price agreement
+    // ═══════════════════════════════════════════════════════════════════════
+    // Previously a commission only ever had one quotedPrice, set unilaterally
+    // by the admin, with no way for the customer to push back on it from the
+    // site itself (or for either side to see who actually agreed to what).
+    // Now: quotedPrice is "the price currently on the table", proposedBy
+    // records who put it there, and adminApproved/userApproved each track
+    // whether THAT side has signed off on it. Proposing a new price always
+    // counts as self-approving it (you wouldn't propose a number you don't
+    // want) and resets the OTHER side's approval, since the number changed
+    // out from under them. Only once both flags are true at the same time is
+    // payment allowed — see POST /commissions/:id/accept, which now checks
+    // this instead of just "is there a price at all". negotiationLog is the
+    // full back-and-forth history, shown to both sides for transparency.
+    proposedBy:   { type:String, default:null, enum:[null,'admin','user'] },
+    adminApproved:{ type:Boolean, default:false },
+    userApproved: { type:Boolean, default:false },
+    negotiationLog: [{
+        by:      { type:String, enum:['admin','user'] },
+        price:   Number,
+        message: { type:String, default:'' },
+        at:      { type:Date, default:Date.now }
+    }],
     adminNote:    { type:String, default:'' },   // visible to customer
     internalNote: { type:String, default:'' },   // admin-only
     completedAt:  { type:Date, default:null },
@@ -427,7 +469,13 @@ function _initMailer() {
             host: process.env.SMTP_HOST,
             port: parseInt(process.env.SMTP_PORT, 10) || 587,
             secure: process.env.SMTP_SECURE === 'true', // true for port 465, false for 587/STARTTLS
-            auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: process.env.SMTP_PASS || process.env.EMAIL_PASS }
+            auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: process.env.SMTP_PASS || process.env.EMAIL_PASS },
+            // NEW: belt-and-suspenders alongside dns.setDefaultResultOrder
+            // above — forces the actual TCP socket to dial out over IPv4 only,
+            // so this specific connection can't hit ENETUNREACH from an IPv6
+            // route even if some other part of the stack ignores the global
+            // DNS order setting.
+            family: 4
         });
         mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587})`;
     } else if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
@@ -438,7 +486,8 @@ function _initMailer() {
         // failing with an auth error.
         mailer = nodemailer.createTransport({
             service: 'gmail',
-            auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+            auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
+            family: 4
         });
         mailerStatus.transport = `Gmail (${process.env.EMAIL_USER})`;
     } else {
@@ -892,7 +941,7 @@ async function attachLinkedOrderStatus(commissionOrList) {
 app.get('/api/commissions/track/:commissionId', async (req,res) => {
     try {
         const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() })
-            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId');
+            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId proposedBy adminApproved userApproved negotiationLog');
         if (!c) return res.status(404).json({ message:'Commission not found. Please check your ID.' });
         await attachLinkedOrderStatus(c);
         res.json({ commission: c });
@@ -906,7 +955,7 @@ app.post('/api/commissions/track', async (req,res) => {
         if (!email || !emailRx.test(email.trim().toLowerCase())) return res.status(400).json({ message:'Enter a valid email address' });
         const commissions = await Commission.find({ email:email.toLowerCase().trim() })
             .sort({ createdAt:-1 })
-            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId');
+            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId proposedBy adminApproved userApproved negotiationLog');
         await attachLinkedOrderStatus(commissions);
         res.json({ commissions });
     } catch { res.status(500).json({ message:'Error' }); }
@@ -926,12 +975,58 @@ app.post('/api/commissions/track', async (req,res) => {
 // Placed → Confirmed → Processing → Shipped → Out for Delivery → Delivered
 // pipeline as a normal product purchase, fully visible in the admin Orders tab
 // right alongside everything else.
+// ═══════════════════════════════════════════════════════════════════════════
+//  COMMISSION NEGOTIATION — customer side
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/api/commissions/:commissionId/propose', optionalAuth, async (req,res) => {
+    try {
+        const { price, message } = req.body;
+        const p = Number(price);
+        if (!p || p <= 0) return res.status(400).json({ message:'Enter a valid price.' });
+        const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() });
+        if (!c) return res.status(404).json({ message:'Commission not found.' });
+        if (c.status === 'Converted') return res.status(400).json({ message:'This commission has already been paid for and converted into an order.' });
+        if (!c.quotedPrice) return res.status(400).json({ message:'Design Den hasn\'t sent an initial quote yet — please wait for that first.' });
+        c.quotedPrice = p;
+        c.proposedBy = 'user';
+        c.userApproved = true;    // proposing is self-approving
+        c.adminApproved = false; // the number changed — admin needs to weigh in again
+        c.negotiationLog.push({ by:'user', price:p, message: (message||'').trim() });
+        await c.save();
+        if (ADMIN_NOTIFY_EMAIL) sendMail(ADMIN_NOTIFY_EMAIL, `${c.name} Countered — ${c.commissionId} 💬`, commissionNegotiationEmail(c, 'admin'));
+        res.json({ commission:c });
+    } catch(e) { res.status(400).json({ message:e.message }); }
+});
+
+app.post('/api/commissions/:commissionId/approve-quote', optionalAuth, async (req,res) => {
+    try {
+        const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() });
+        if (!c) return res.status(404).json({ message:'Commission not found.' });
+        if (!c.quotedPrice) return res.status(400).json({ message:'There is no price to approve yet.' });
+        if (c.userApproved) return res.json({ commission:c }); // already approved, no-op
+        c.userApproved = true;
+        c.negotiationLog.push({ by:'user', price:c.quotedPrice, message:'Approved' });
+        await c.save();
+        if (ADMIN_NOTIFY_EMAIL) sendMail(ADMIN_NOTIFY_EMAIL, `${c.name} Approved the Price — ${c.commissionId} 👍`, commissionNegotiationEmail(c, 'admin'));
+        res.json({ commission:c });
+    } catch(e) { res.status(400).json({ message:e.message }); }
+});
+
 app.post('/api/commissions/:commissionId/accept', optionalAuth, async (req,res) => {
     try {
         const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() });
         if (!c) return res.status(404).json({ message:'Commission not found.' });
         if (!['Quoted','Accepted'].includes(c.status)) return res.status(400).json({ message:'This commission does not have an active quote to accept.' });
         if (!c.quotedPrice || c.quotedPrice <= 0) return res.status(400).json({ message:'No quoted price has been set yet.' });
+        // NEW: payment can only start once BOTH sides have approved the SAME
+        // current price — previously this only checked that a price existed
+        // at all, which meant a customer could pay an admin's opening offer
+        // without any real back-and-forth, and there was no way to actually
+        // negotiate. This is the gate that makes the dual-approval flow real
+        // rather than cosmetic.
+        if (!c.adminApproved || !c.userApproved) {
+            return res.status(400).json({ message:'Both you and Design Den need to approve the current price before payment can start.' });
+        }
         if (c.status !== 'Accepted') { c.status = 'Accepted'; await c.save(); }
         // Reuses the exact same Razorpay order-creation shape as /api/payment/create-order,
         // just sourcing the amount from the commission's quotedPrice instead of a cart total.
@@ -1058,7 +1153,7 @@ app.get('/api/user/commissions', auth, async (req,res) => {
         if (!user) return res.status(404).json({ message:'User not found' });
         const commissions = await Commission.find({ email: user.email })
             .sort({ createdAt:-1 })
-            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId');
+            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId proposedBy adminApproved userApproved negotiationLog');
         await attachLinkedOrderStatus(commissions);
         res.json({ commissions });
     } catch { res.status(500).json({ message:'Error' }); }
@@ -1216,6 +1311,52 @@ function commissionStatusEmail(c) {
       <a href="${STORE_URL}/#custom" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:13px 32px;border-radius:999px;font-weight:800;font-size:0.8rem;letter-spacing:2px;text-transform:uppercase;">Track Commission →</a>
     </div>`)
 }
+
+// NEW: sent on every negotiation event — a new price proposal from either
+// side, or an approval. `toRole` is who's RECEIVING this email ('admin' or
+// 'user'), so the copy can correctly say "the customer proposed..." vs
+// "Design Den proposed...". Keeps both sides actively informed through the
+// back-and-forth instead of needing to keep refreshing the tracker page to
+// find out whether anything changed.
+function commissionNegotiationEmail(c, toRole) {
+    const last = c.negotiationLog[c.negotiationLog.length - 1];
+    const otherRole = toRole === 'admin' ? 'user' : 'admin';
+    const otherName = otherRole === 'admin' ? 'Design Den' : c.name;
+    const isApproval = last && last.by === otherRole && c.negotiationLog.length > 1
+        && c.negotiationLog[c.negotiationLog.length - 2]?.price === last.price;
+    const bothApproved = c.adminApproved && c.userApproved;
+    let icon, title, msg;
+    if (bothApproved) {
+        icon = '🎉'; title = 'Price Agreed!';
+        msg = toRole === 'user'
+            ? `You and Design Den have agreed on ₹${c.quotedPrice.toLocaleString('en-IN')} — complete payment to confirm your order.`
+            : `You and ${c.name} have agreed on ₹${c.quotedPrice.toLocaleString('en-IN')}. Once they pay, this becomes a tracked order automatically.`;
+    } else if (isApproval) {
+        icon = '👍'; title = `${otherName} Approved Your Price`;
+        msg = `₹${c.quotedPrice.toLocaleString('en-IN')} has been approved by ${otherName}.` + (toRole === 'user' ? ' Approve it too to move forward with payment.' : ' Waiting on your approval to proceed.');
+    } else {
+        icon = '💬'; title = `${otherName} Proposed a New Price`;
+        msg = `${otherName} suggested ₹${c.quotedPrice.toLocaleString('en-IN')}${last?.message ? ' — "' + last.message + '"' : ''}.`;
+    }
+    return emailWrap(`
+    <div style="text-align:center;margin-bottom:28px;">
+      <div style="font-size:3rem;margin-bottom:12px;">${icon}</div>
+      <h2 style="font-family:Georgia,serif;font-size:1.8rem;color:#3D1A0E;margin:0 0 8px;">${title}</h2>
+      <p style="color:rgba(61,26,14,0.55);margin:0;font-size:0.9rem;">${msg}</p>
+    </div>
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#F7EDE6;border-radius:16px;margin-bottom:20px;">
+      <tr>
+        <td style="padding:20px 24px;" align="left"><div style="font-size:0.6rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;margin-bottom:4px;">Commission ID</div><div style="font-family:Georgia,serif;font-size:1.3rem;font-weight:700;color:#3D1A0E;">${c.commissionId}</div></td>
+        <td style="padding:20px 24px;" align="right" valign="top"><div style="font-size:0.6rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:rgba(61,26,14,0.4);margin-bottom:4px;">Current Price</div><div style="font-family:Georgia,serif;font-size:1.3rem;font-weight:700;color:#3D1A0E;">₹${c.quotedPrice.toLocaleString('en-IN')}</div></td>
+      </tr>
+    </table>
+    <div style="text-align:center;margin-top:20px;">
+      ${toRole === 'admin'
+        ? `<a href="${STORE_URL}" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:13px 32px;border-radius:999px;font-weight:800;font-size:0.8rem;letter-spacing:2px;text-transform:uppercase;">Open Admin Panel →</a>`
+        : `<a href="${STORE_URL}/#custom" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:13px 32px;border-radius:999px;font-weight:800;font-size:0.8rem;letter-spacing:2px;text-transform:uppercase;">Review &amp; Respond →</a>`}
+    </div>`)
+}
+
 
 // NEW: sent the moment a commission's payment is verified and a real Order is
 // created from it. Gives the customer their actual Order ID right away — from
@@ -1863,6 +2004,17 @@ app.put('/api/admin/commissions/:id', adminAuth, async (req,res) => {
         if (prev.status === 'Converted' && (req.body.status !== undefined || req.body.quotedPrice !== undefined)) {
             return res.status(400).json({ message:'This commission has already been paid for and converted into an order — update the linked order instead.' });
         }
+        // NEW: quotedPrice now flows through the negotiation endpoints below
+        // (POST .../propose and .../approve) instead of this generic update,
+        // since setting it here would change the price on record without
+        // updating proposedBy/adminApproved/userApproved or recording it in
+        // negotiationLog — leaving the two sides' agreement state silently
+        // inconsistent with the actual number. Every other field (status
+        // transitions like Cancelled, internalNote, etc.) still goes through
+        // here as before.
+        if (req.body.quotedPrice !== undefined) {
+            return res.status(400).json({ message:'Use the Propose Price action to set or change the quoted price.' });
+        }
         const update = { ...req.body };
         if (update.status === 'Completed' && !prev.completedAt) update.completedAt = new Date();
         const c = await Commission.findByIdAndUpdate(req.params.id, update, { new:true, runValidators:true });
@@ -1874,6 +2026,50 @@ app.put('/api/admin/commissions/:id', adminAuth, async (req,res) => {
         res.json({ commission:c });
     } catch(e) { res.status(400).json({ message:e.message }); }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  COMMISSION NEGOTIATION — admin side
+// ═══════════════════════════════════════════════════════════════════════════
+// NEW: replaces the old "admin sets quotedPrice once, customer either pays or
+// doesn't" model. The admin can now propose a price (first quote, or a
+// counter to whatever the customer last suggested) or simply approve the
+// price the customer most recently proposed — and a real Order is only ever
+// created once BOTH sides have approved the SAME number (see
+// POST /commissions/:id/accept further down, which now gates on this).
+app.post('/api/admin/commissions/:id/propose', adminAuth, async (req,res) => {
+    try {
+        const { price, message } = req.body;
+        const p = Number(price);
+        if (!p || p <= 0) return res.status(400).json({ message:'Enter a valid price.' });
+        const c = await Commission.findById(req.params.id);
+        if (!c) return res.status(404).json({ message:'Not found' });
+        if (c.status === 'Converted') return res.status(400).json({ message:'This commission has already been paid for and converted into an order.' });
+        c.quotedPrice = p;
+        c.proposedBy = 'admin';
+        c.adminApproved = true;   // proposing is self-approving
+        c.userApproved = false;  // the number changed — customer needs to weigh in again
+        c.negotiationLog.push({ by:'admin', price:p, message: (message||'').trim() });
+        if (c.status === 'New') c.status = 'Quoted';
+        await c.save();
+        if (c.email) sendMail(c.email, `New Price Proposed — ${c.commissionId} 💬`, commissionNegotiationEmail(c, 'user'));
+        res.json({ commission:c });
+    } catch(e) { res.status(400).json({ message:e.message }); }
+});
+
+app.post('/api/admin/commissions/:id/approve', adminAuth, async (req,res) => {
+    try {
+        const c = await Commission.findById(req.params.id);
+        if (!c) return res.status(404).json({ message:'Not found' });
+        if (!c.quotedPrice) return res.status(400).json({ message:'There is no price to approve yet.' });
+        if (c.adminApproved) return res.json({ commission:c }); // already approved, no-op
+        c.adminApproved = true;
+        c.negotiationLog.push({ by:'admin', price:c.quotedPrice, message:'Approved' });
+        await c.save();
+        if (c.email) sendMail(c.email, `Design Den Approved Your Price — ${c.commissionId} 👍`, commissionNegotiationEmail(c, 'user'));
+        res.json({ commission:c });
+    } catch(e) { res.status(400).json({ message:e.message }); }
+});
+
 app.delete('/api/admin/commissions/:id', adminAuth, async (req,res) => { try{await Commission.findByIdAndDelete(req.params.id);res.json({success:true});}catch{res.status(500).json({message:'Error'});} });
 
 // ── Admin customers ───────────────────────────────────────────────────────────
