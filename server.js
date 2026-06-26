@@ -12,7 +12,6 @@ const cors        = require('cors');
 const Razorpay    = require('razorpay');
 const crypto      = require('crypto');
 const nodemailer  = require('nodemailer');
-const { Resend }  = require('resend');
 const helmet      = require('helmet');             // NEW — security headers (npm i helmet)
 const rateLimit   = require('express-rate-limit');  // NEW — brute-force protection (npm i express-rate-limit)
 
@@ -462,43 +461,33 @@ let mailer = null;
 // from a failed-send count with no further detail.
 let mailerStatus = { configured:false, ok:null, error:null, checkedAt:null, transport:null };
 
-// ─── Email transport (priority order) ────────────────────────────────────────
-// 1. Resend  — RESEND_API_KEY set  → uses HTTP API, no port issues on any host
-// 2. SMTP    — SMTP_HOST set       → explicit host/port/auth (generic provider)
-// 3. Gmail   — EMAIL_USER/PASS set → Gmail service shorthand (App Password req.)
-// ─────────────────────────────────────────────────────────────────────────────
-
-let resendClient = null; // set when Resend is the active transport
-
 function _initMailer() {
-    if (process.env.RESEND_API_KEY) {
-        // Best option for cloud deployments: pure HTTPS, no SMTP ports needed.
-        resendClient = new Resend(process.env.RESEND_API_KEY);
-        mailerStatus = { configured:true, ok:true, error:null, checkedAt:new Date(), transport:`Resend API` };
-        console.log('✅ Email ready — Resend API');
-        return;
-    }
     if (process.env.SMTP_HOST) {
-        // Generic SMTP — works with any provider (custom domain mailboxes,
-        // SES, SendGrid, Mailgun, Postmark, Zoho, Outlook/Office365, etc).
         mailer = nodemailer.createTransport({
             host: process.env.SMTP_HOST,
             port: parseInt(process.env.SMTP_PORT, 10) || 587,
             secure: process.env.SMTP_SECURE === 'true',
             auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: process.env.SMTP_PASS || process.env.EMAIL_PASS },
-            family: 4
+            family: 4,                // force IPv4 — avoids ENETUNREACH on IPv6-only hosts
+            connectionTimeout: 10000, // 10 s — fail fast instead of hanging forever
+            greetingTimeout:   5000,
+            socketTimeout:     10000,
+            tls: { rejectUnauthorized: false } // some deployment proxies have self-signed certs
         });
         mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587})`;
     } else if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
         mailer = nodemailer.createTransport({
             service: 'gmail',
             auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
-            family: 4
+            family: 4,
+            connectionTimeout: 10000,
+            greetingTimeout:   5000,
+            socketTimeout:     10000
         });
         mailerStatus.transport = `Gmail (${process.env.EMAIL_USER})`;
     } else {
-        console.warn('⚠️  No email transport configured — set RESEND_API_KEY, or EMAIL_USER/EMAIL_PASS, or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS.');
-        mailerStatus = { configured:false, ok:false, error:'No email transport configured.', checkedAt:new Date(), transport:null };
+        console.warn('⚠️  No email transport configured — set EMAIL_USER/EMAIL_PASS (Gmail) or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS.');
+        mailerStatus = { configured:false, ok:false, error:'No EMAIL_USER/EMAIL_PASS or SMTP_HOST configured.', checkedAt:new Date(), transport:null };
         return;
     }
     mailerStatus.configured = true;
@@ -517,23 +506,10 @@ function _initMailer() {
 }
 _initMailer();
 
-const EMAIL_FROM_ADDRESS = process.env.RESEND_FROM || process.env.SMTP_USER || process.env.EMAIL_USER || 'noreply@designden.studio';
+const EMAIL_FROM_ADDRESS = process.env.SMTP_USER || process.env.EMAIL_USER;
 
 async function sendMail(to, subject, html) {
-    // ── Resend path (HTTP API) ──────────────────────────────────────────────
-    if (resendClient) {
-        try {
-            await resendClient.emails.send({ from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html });
-            console.log(`📧 Email sent to ${to} via Resend`);
-            await EmailLog.create({ to, subject, status:'sent' }).catch(()=>{});
-        } catch(err) {
-            console.warn(`⚠️  Resend email to ${to} failed:`, err.message);
-            await EmailLog.create({ to, subject, status:'failed', error:err.message }).catch(()=>{});
-        }
-        return;
-    }
-    // ── Nodemailer / SMTP path ──────────────────────────────────────────────
-    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured' }).catch(()=>{}); return; }
+    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
     try {
         await mailer.sendMail({ from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html });
         console.log(`📧 Email sent to ${to}`);
