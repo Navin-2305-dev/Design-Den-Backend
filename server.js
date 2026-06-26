@@ -3,7 +3,9 @@
 // ║  Node.js + Express + MongoDB + Razorpay + Nodemailer                     ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 require('dotenv').config();
-const dns         = require('dns');
+const dns = require('dns');
+const { promisify } = require('util');
+const resolve4 = promisify(dns.resolve4);
 
 // ─── FORCE IPv4 GLOBALLY ────────────────────────────────────────────────────
 // Render, Railway, and similar platforms lack outbound IPv6. If Node ever
@@ -341,50 +343,66 @@ let mailer = null;
 let mailerStatus = { configured:false, ok:null, error:null, checkedAt:null, transport:null };
 
 function _initMailer() {
-    if (process.env.SMTP_HOST) {
-        const smtpPass = (process.env.SMTP_PASS || process.env.EMAIL_PASS || '').replace(/\s+/g, '');
-        mailer = nodemailer.createTransport({
-            host: process.env.SMTP_HOST,
-            port: parseInt(process.env.SMTP_PORT, 10) || 587,
-            secure: process.env.SMTP_SECURE === 'true',
-            auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: smtpPass },
-            connectionTimeout: 10000,
-            greetingTimeout:   10000,
-            socketTimeout:     15000,
-            tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' }
-        });
-        mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587})`;
-    } else if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
-        const gmailPass = process.env.EMAIL_PASS.replace(/\s+/g, '');
-        mailer = nodemailer.createTransport({
-            host: 'smtp.gmail.com',
-            port: 465,
-            secure: true,
-            auth: { user: process.env.EMAIL_USER, pass: gmailPass },
-            connectionTimeout: 10000,
-            greetingTimeout:   10000,
-            socketTimeout:     15000,
-            tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' }
-        });
-        mailerStatus.transport = `Gmail (${process.env.EMAIL_USER}) via smtp.gmail.com:465`;
-    } else {
-        console.warn('⚠️  No email transport configured — set EMAIL_USER/EMAIL_PASS (Gmail) or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS (any provider) to enable emails.');
-        mailerStatus = { configured:false, ok:false, error:'No EMAIL_USER/EMAIL_PASS or SMTP_HOST configured.', checkedAt:new Date(), transport:null };
-        return;
-    }
-    mailerStatus.configured = true;
-    mailer.verify(err => {
-        mailerStatus.checkedAt = new Date();
-        if (err) {
-            mailerStatus.ok = false;
-            mailerStatus.error = err.message;
-            console.warn('⚠️  Email transport error:', err.message);
-        } else {
-            mailerStatus.ok = true;
-            mailerStatus.error = null;
-            console.log('✅ Email ready —', mailerStatus.transport);
+    // ── Helper: resolve hostname to IPv4 address ────────────────────────
+    async function resolveIPv4(hostname) {
+        try {
+            const addrs = await resolve4(hostname);
+            if (addrs && addrs.length) return addrs[0];   // first IPv4
+        } catch {
+            // fallback to hostname if resolution fails
         }
-    });
+        return hostname;
+    }
+
+    (async () => {
+        if (process.env.SMTP_HOST) {
+            const ip = await resolveIPv4(process.env.SMTP_HOST);
+            const smtpPass = (process.env.SMTP_PASS || process.env.EMAIL_PASS || '').replace(/\s+/g, '');
+            mailer = nodemailer.createTransport({
+                host: ip,                          // ← raw IPv4 address
+                port: parseInt(process.env.SMTP_PORT, 10) || 587,
+                secure: process.env.SMTP_SECURE === 'true',
+                auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: smtpPass },
+                connectionTimeout: 10000,
+                greetingTimeout:   10000,
+                socketTimeout:     15000,
+                tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' }
+            });
+            mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587}) [IPv4: ${ip}]`;
+        } else if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+            const ip = await resolveIPv4('smtp.gmail.com');
+            const gmailPass = process.env.EMAIL_PASS.replace(/\s+/g, '');
+            mailer = nodemailer.createTransport({
+                host: ip,
+                port: 465,
+                secure: true,
+                auth: { user: process.env.EMAIL_USER, pass: gmailPass },
+                connectionTimeout: 10000,
+                greetingTimeout:   10000,
+                socketTimeout:     15000,
+                tls: { rejectUnauthorized: true, minVersion: 'TLSv1.2' }
+            });
+            mailerStatus.transport = `Gmail (${process.env.EMAIL_USER}) via smtp.gmail.com:465 [IPv4: ${ip}]`;
+        } else {
+            console.warn('⚠️  No email transport configured – set EMAIL_USER/EMAIL_PASS (Gmail) or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS (any provider) to enable emails.');
+            mailerStatus = { configured:false, ok:false, error:'No EMAIL_USER/EMAIL_PASS or SMTP_HOST configured.', checkedAt:new Date(), transport:null };
+            return;
+        }
+
+        mailerStatus.configured = true;
+        mailer.verify(err => {
+            mailerStatus.checkedAt = new Date();
+            if (err) {
+                mailerStatus.ok = false;
+                mailerStatus.error = err.message;
+                console.warn('⚠️  Email transport error:', err.message);
+            } else {
+                mailerStatus.ok = true;
+                mailerStatus.error = null;
+                console.log('✅ Email ready —', mailerStatus.transport);
+            }
+        });
+    })();
 }
 _initMailer();
 
