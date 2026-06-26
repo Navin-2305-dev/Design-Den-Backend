@@ -463,30 +463,37 @@ let mailerStatus = { configured:false, ok:null, error:null, checkedAt:null, tran
 
 function _initMailer() {
     if (process.env.SMTP_HOST) {
+        // Generic SMTP — works with any provider (custom domain mailboxes,
+        // SES, SendGrid, Mailgun, Postmark, Zoho, Outlook/Office365, etc).
         mailer = nodemailer.createTransport({
             host: process.env.SMTP_HOST,
             port: parseInt(process.env.SMTP_PORT, 10) || 587,
-            secure: process.env.SMTP_SECURE === 'true',
+            secure: process.env.SMTP_SECURE === 'true', // true for port 465, false for 587/STARTTLS
             auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: process.env.SMTP_PASS || process.env.EMAIL_PASS },
-            family: 4,                // force IPv4 — avoids ENETUNREACH on IPv6-only hosts
-            connectionTimeout: 10000, // 10 s — fail fast instead of hanging forever
-            greetingTimeout:   5000,
-            socketTimeout:     10000,
-            tls: { rejectUnauthorized: false } // some deployment proxies have self-signed certs
+            // NEW: belt-and-suspenders alongside dns.setDefaultResultOrder
+            // above — forces the actual TCP socket to dial out over IPv4 only,
+            // so this specific connection can't hit ENETUNREACH from an IPv6
+            // route even if some other part of the stack ignores the global
+            // DNS order setting.
+            family: 4
         });
         mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587})`;
     } else if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+        // Backward-compatible default: Gmail service shorthand. Requires an
+        // App Password (not a regular account password) when 2FA is on,
+        // which Google effectively requires for SMTP access now — using a
+        // regular password is one of the most common causes of every send
+        // failing with an auth error.
         mailer = nodemailer.createTransport({
-            service: 'gmail',
-            auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
-            family: 4,
-            connectionTimeout: 10000,
-            greetingTimeout:   5000,
-            socketTimeout:     10000
-        });
-        mailerStatus.transport = `Gmail (${process.env.EMAIL_USER})`;
+         host: 'smtp.gmail.com',
+         port: 465,
+         secure: true,
+         auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
+         family: 4
+     });
+     mailerStatus.transport = `Gmail (${process.env.EMAIL_USER}) via smtp.gmail.com:465`;
     } else {
-        console.warn('⚠️  No email transport configured — set EMAIL_USER/EMAIL_PASS (Gmail) or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS.');
+        console.warn('⚠️  No email transport configured — set EMAIL_USER/EMAIL_PASS (Gmail) or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS (any provider) to enable emails.');
         mailerStatus = { configured:false, ok:false, error:'No EMAIL_USER/EMAIL_PASS or SMTP_HOST configured.', checkedAt:new Date(), transport:null };
         return;
     }
