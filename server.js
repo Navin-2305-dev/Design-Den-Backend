@@ -481,25 +481,76 @@ const EmailLog    = mongoose.model('EmailLog',    emailLogSchema);
 // ─── Razorpay ─────────────────────────────────────────────────────────────────
 const razorpay = new Razorpay({ key_id:process.env.RAZORPAY_KEY_ID||'rzp_test_placeholder', key_secret:process.env.RAZORPAY_KEY_SECRET||'placeholder' });
 
-// ─── Email transporter ────────────────────────────────────────────────────────
-// NEW: previously this only ever built a Gmail-service transporter — fine if
-// EMAIL_USER is a real Gmail/Google Workspace address using an App Password,
-// but completely silent-broken for anyone using a custom domain, Outlook, or
-// a transactional provider (SES, SendGrid, Mailgun, etc.) via plain SMTP.
-// Every send would fail with no visible symptom beyond an EmailLog entry
-// nothing in the admin UI used to show. Now: if SMTP_HOST is set, use a
-// generic SMTP transport (works with any provider); otherwise fall back to
-// the original Gmail-service behavior for backward compatibility with
-// existing deployments that already had EMAIL_USER/EMAIL_PASS as Gmail
-// credentials and nothing else configured.
-let mailer = null;
+// ─── Email transport ──────────────────────────────────────────────────────────
+// Three transports are supported, tried in this priority order:
+//   1. Brevo's HTTP API (BREVO_API_KEY set) — sends over plain HTTPS (port
+//      443), which Render's free tier never blocks (blocking it would break
+//      the web server itself). This is the fix for Render's free-tier SMTP
+//      port block: Render blocks outbound traffic on SMTP ports 25/465/587
+//      for free web services (confirmed in Render's own changelog, live
+//      since Sept 26 2025) — no code change can route around a platform
+//      firewall rule, but switching off SMTP entirely sidesteps it.
+//   2. Generic SMTP via SMTP_HOST (any provider) — kept for flexibility if
+//      you move to a paid Render instance (which lifts the port block) or a
+//      host that doesn't restrict SMTP ports.
+//   3. Gmail-service shorthand via EMAIL_USER/EMAIL_PASS — original
+//      backward-compatible default. Still hits Render's free-tier port
+//      block; kept for non-Render deployments / local development only.
+let mailer = null;      // nodemailer transport — only used by modes 2 and 3
+let mailerMode = null;  // 'brevo' | 'smtp' | null (null = not configured)
 // NEW: tracks live transport health so the admin panel can show "is email
 // actually working" instead of the admin only finding out after the fact
 // from a failed-send count with no further detail.
 let mailerStatus = { configured:false, ok:null, error:null, checkedAt:null, transport:null };
 
-function _initMailer() {
+const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
+// The address you verified as a "Sender" in Brevo (Settings → Senders).
+// Defaults to EMAIL_USER so existing deployments that just add
+// BREVO_API_KEY (and keep EMAIL_USER set to their verified Gmail address)
+// work with no other env changes.
+const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL || process.env.EMAIL_USER || '';
+const EMAIL_FROM_NAME = process.env.EMAIL_FROM_NAME || 'Design Den 🧶';
+const EMAIL_FROM_ADDRESS = BREVO_API_KEY ? BREVO_SENDER_EMAIL : (process.env.SMTP_USER || process.env.EMAIL_USER);
+
+async function _initMailer() {
+    if (BREVO_API_KEY) {
+        mailerMode = 'brevo';
+        mailerStatus.configured = true;
+        mailerStatus.transport = `Brevo API (sender: ${BREVO_SENDER_EMAIL || 'not set'})`;
+        if (!BREVO_SENDER_EMAIL) {
+            mailerStatus.ok = false;
+            mailerStatus.checkedAt = new Date();
+            mailerStatus.error = 'BREVO_API_KEY is set but no sender email configured — set BREVO_SENDER_EMAIL (or EMAIL_USER) to the address you verified as a Sender in Brevo.';
+            console.warn('⚠️ ', mailerStatus.error);
+            return;
+        }
+        // Lightweight equivalent of nodemailer's mailer.verify() — confirms
+        // the API key is valid without actually sending an email.
+        try {
+            const res = await fetch('https://api.brevo.com/v3/account', {
+                headers: { accept:'application/json', 'api-key':BREVO_API_KEY }
+            });
+            mailerStatus.checkedAt = new Date();
+            if (res.ok) {
+                mailerStatus.ok = true;
+                mailerStatus.error = null;
+                console.log('✅ Email ready —', mailerStatus.transport);
+            } else {
+                mailerStatus.ok = false;
+                mailerStatus.error = `Brevo responded ${res.status} — check that BREVO_API_KEY is a valid v3 API key (not an SMTP key).`;
+                console.warn('⚠️ ', mailerStatus.error);
+            }
+        } catch (err) {
+            mailerStatus.checkedAt = new Date();
+            mailerStatus.ok = false;
+            mailerStatus.error = err.message;
+            console.warn('⚠️  Could not reach Brevo to verify the API key:', err.message);
+        }
+        return;
+    }
+
     if (process.env.SMTP_HOST) {
+        mailerMode = 'smtp';
         // Generic SMTP — works with any provider (custom domain mailboxes,
         // SES, SendGrid, Mailgun, Postmark, Zoho, Outlook/Office365, etc).
         mailer = nodemailer.createTransport({
@@ -513,16 +564,19 @@ function _initMailer() {
             // before opening the socket, so there's no hostname left at
             // connect-time for `family` to influence. The real fix for that
             // is the dns.Resolver.prototype.resolve6 patch up near the top
-            // of the file.
+            // of the file. None of this helps with Render's free-tier SMTP
+            // port block though — that's what BREVO_API_KEY is for, above.
             family: 4
         });
         mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587})`;
     } else if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+        mailerMode = 'smtp';
         // Backward-compatible default: Gmail service shorthand. Requires an
         // App Password (not a regular account password) when 2FA is on,
         // which Google effectively requires for SMTP access now — using a
         // regular password is one of the most common causes of every send
-        // failing with an auth error.
+        // failing with an auth error. NOTE: hits Render's free-tier SMTP
+        // port block — use BREVO_API_KEY instead if you're on Render free tier.
         mailer = nodemailer.createTransport({
          host: 'smtp.gmail.com',
          port: 465,
@@ -532,8 +586,8 @@ function _initMailer() {
      });
      mailerStatus.transport = `Gmail (${process.env.EMAIL_USER}) via smtp.gmail.com:465`;
     } else {
-        console.warn('⚠️  No email transport configured — set EMAIL_USER/EMAIL_PASS (Gmail) or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS (any provider) to enable emails.');
-        mailerStatus = { configured:false, ok:false, error:'No EMAIL_USER/EMAIL_PASS or SMTP_HOST configured.', checkedAt:new Date(), transport:null };
+        console.warn('⚠️  No email transport configured — set BREVO_API_KEY (recommended on Render), or EMAIL_USER/EMAIL_PASS, or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS, to enable emails.');
+        mailerStatus = { configured:false, ok:false, error:'No BREVO_API_KEY, EMAIL_USER/EMAIL_PASS, or SMTP_HOST configured.', checkedAt:new Date(), transport:null };
         return;
     }
     mailerStatus.configured = true;
@@ -552,12 +606,45 @@ function _initMailer() {
 }
 _initMailer();
 
-const EMAIL_FROM_ADDRESS = process.env.SMTP_USER || process.env.EMAIL_USER;
+// Sends one email through whichever transport ended up active. `attachment`,
+// when given, is in nodemailer's shape ({filename, content, encoding,
+// contentType}) and gets translated into Brevo's shape ({name, content})
+// when mailerMode is 'brevo' — this lets sendMail() and sendPatternMail()
+// share one dispatcher without either needing to know which transport is live.
+async function _dispatchMail(to, subject, html, attachment) {
+    if (mailerMode === 'brevo') {
+        const payload = {
+            sender: { name: EMAIL_FROM_NAME, email: EMAIL_FROM_ADDRESS },
+            to: [{ email: to }],
+            subject,
+            htmlContent: html
+        };
+        if (attachment) {
+            payload.attachment = [{ name: attachment.filename, content: attachment.content }];
+        }
+        const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+            method: 'POST',
+            headers: { accept:'application/json', 'content-type':'application/json', 'api-key':BREVO_API_KEY },
+            body: JSON.stringify(payload)
+        });
+        if (!res.ok) {
+            const body = await res.text().catch(() => '');
+            throw new Error(`Brevo ${res.status}: ${body.slice(0, 300)}`);
+        }
+        return;
+    }
+    if (mailerMode === 'smtp') {
+        const mailOpts = { from:`"${EMAIL_FROM_NAME}" <${EMAIL_FROM_ADDRESS}>`, to, subject, html };
+        if (attachment) mailOpts.attachments = [attachment];
+        await mailer.sendMail(mailOpts);
+        return;
+    }
+    throw new Error('Mailer not configured (set BREVO_API_KEY, EMAIL_USER/EMAIL_PASS, or SMTP_HOST)');
+}
 
 async function sendMail(to, subject, html) {
-    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
     try {
-        await mailer.sendMail({ from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html });
+        await _dispatchMail(to, subject, html);
         console.log(`📧 Email sent to ${to}`);
         await EmailLog.create({ to, subject, status:'sent' }).catch(()=>{});
     } catch(err) {
