@@ -3,28 +3,7 @@
 // ║  Node.js + Express + MongoDB + Razorpay + Nodemailer                     ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 require('dotenv').config();
-const dns = require('dns');
-const { promisify } = require('util');
-const resolve4 = promisify(dns.resolve4);
-
-// ─── FORCE IPv4 GLOBALLY ────────────────────────────────────────────────────
-// Render, Railway, and similar platforms lack outbound IPv6. If Node ever
-// resolves an IPv6 address, the connection will fail with ENETUNREACH.
-// This monkey‑patch makes every dns.lookup() call request only A (IPv4)
-// records, preventing IPv6 connections entirely.
-dns.setDefaultResultOrder('ipv4first');            // prefer A over AAAA
-const _nativeLookup = dns.lookup;
-dns.lookup = (hostname, options, callback) => {
-    if (typeof options === 'function') {
-        callback = options;
-        options = {};
-    }
-    options = options || {};
-    options.family = 4;                             // force IPv4
-    return _nativeLookup(hostname, options, callback);
-};
-// ────────────────────────────────────────────────────────────────────────────
-
+const dns         = require('dns');
 const express     = require('express');
 const mongoose    = require('mongoose');
 const bcrypt      = require('bcryptjs');
@@ -33,34 +12,82 @@ const cors        = require('cors');
 const Razorpay    = require('razorpay');
 const crypto      = require('crypto');
 const nodemailer  = require('nodemailer');
-const helmet      = require('helmet');
-const rateLimit   = require('express-rate-limit');
+const helmet      = require('helmet');             // NEW — security headers (npm i helmet)
+const rateLimit   = require('express-rate-limit');  // NEW — brute-force protection (npm i express-rate-limit)
+
+// NEW: fixes "connect ENETUNREACH 2404:....:465" email failures. Gmail's SMTP
+// hostname resolves to both an IPv4 and an IPv6 address; Node 18+ tries
+// whichever DNS returns first, and many hosts (Render, most container
+// platforms) have no outbound IPv6 route at all, so any IPv6 attempt fails
+// immediately with ENETUNREACH — even though the exact same connection would
+// work instantly over IPv4. This makes IPv4 the preferred order for every
+// outbound DNS lookup in this process (Gmail/SMTP, Razorpay, anything else
+// that resolves a dual-stack hostname), which is the documented Node fix for
+// this exact class of error.
+dns.setDefaultResultOrder('ipv4first');
 
 const app = express();
 
 // ─── Trust proxy ──────────────────────────────────────────────────────────────
+// NEW: required if deployed behind a reverse proxy / load balancer (Render, Railway,
+// nginx, Cloudflare, etc.) so req.ip reflects the real client IP for rate limiting
+// and logging instead of the proxy's IP. Harmless if you're not behind a proxy.
 app.set('trust proxy', 1);
 
 // ─── Security headers ─────────────────────────────────────────────────────────
+// NEW: sets sane defaults (X-Content-Type-Options, X-Frame-Options, HSTS when on
+// HTTPS, etc). CSP is disabled here because this app inlines a LOT of <script> and
+// <style> — enabling Helmet's default CSP without configuring it would break the
+// site. Revisit CSP later once you're ready to externalize remaining inline code.
 app.use(helmet({ contentSecurityPolicy:false, crossOriginEmbedderPolicy:false }));
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
+// CORS: the production frontend domain is hardcoded below as a safe default —
+// this is what actually fixes "CORS error" on the live site. ALLOWED_ORIGINS
+// (optional, comma-separated) lets you ADD more domains (a custom domain,
+// a staging URL, etc.) without removing this default or needing to redeploy
+// just to get back to a working state.
 const DEFAULT_ALLOWED_ORIGINS = [
-    'https://design-den-studio.vercel.app',
+    'https://design-den-studio.vercel.app',  // production frontend (Vercel)
 ];
 const EXTRA_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
+// FIXED: STORE_URL previously fell back to 'http://localhost:5000' — meaning
+// every email (order confirmation, commission updates, pattern delivery)
+// would link customers to a localhost address if this env var were ever
+// unset on Render. Falls back to the real production frontend instead.
 const STORE_URL = (process.env.STORE_URL || 'https://design-den-studio.vercel.app').replace(/\/+$/, '');
+// NEW: where to email the shop owner when a customer counter-proposes a
+// commission price (the admin already sees everything in the panel, but an
+// email means they don't have to keep checking back). Optional — if unset,
+// negotiation emails to the admin are silently skipped rather than erroring,
+// same graceful-degradation pattern used elsewhere for optional config.
 const ADMIN_NOTIFY_EMAIL = process.env.ADMIN_NOTIFY_EMAIL || '';
-
+// Normalize away trailing slashes — "https://x.vercel.app/" and
+// "https://x.vercel.app" are the same origin to a browser but NOT the same
+// string, and a same-string check is exactly what was silently breaking this
+// before. This single normalization is the actual fix for that class of bug.
 const stripTrailingSlash = (s) => s.replace(/\/+$/, '');
 const ALLOWED_ORIGINS = [...new Set([...DEFAULT_ALLOWED_ORIGINS, ...EXTRA_ALLOWED_ORIGINS].map(stripTrailingSlash))];
 
 app.use(cors({
     origin: (origin, callback) => {
+        // No Origin header at all (curl, server-to-server, same-origin requests,
+        // Razorpay webhooks) — always allow; there's no browser CORS check to fail.
         if (!origin) return callback(null, true);
+        // NEW: browsers send the literal string "null" as the Origin header for
+        // file:// pages (e.g. opening admin.html by double-clicking it instead of
+        // serving it from a dev server). This is a real, distinct value — not the
+        // same as no header at all — and needs its own explicit check. Allowed
+        // here since it only ever happens when testing locally from disk.
         if (origin === 'null') return callback(null, true);
+        // Always allow ANY localhost/127.0.0.1 port for local development —
+        // covers Vite, CRA, Live Server, or anything else regardless of port,
+        // without needing to list every possible dev server port individually.
         if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return callback(null, true);
         if (ALLOWED_ORIGINS.includes(stripTrailingSlash(origin))) return callback(null, true);
+        // NEW: log rejected origins so a future mismatch shows up in Render's
+        // logs immediately instead of being a CORS error only visible in the
+        // browser console (where it's much harder to notice/diagnose remotely).
         console.warn(`⚠️  CORS rejected request from origin: ${origin}`);
         callback(new Error('Not allowed by CORS'));
     },
@@ -69,34 +96,57 @@ app.use(cors({
     credentials:false,
     optionsSuccessStatus:200
 }));
+// NEW: bumped from 10mb to 30mb. The admin's multi-image upload widget (and
+// per-variant photos) sends several resized-but-still-base64-encoded images
+// in a single product save — a product with ~6 gallery photos plus 4 variant
+// photos, each resized to ~150-300KB as base64, can comfortably exceed 10mb
+// even though every individual image is small. 30mb gives real headroom
+// without removing the size sanity-check entirely.
 app.use(express.json({ limit:'30mb' }));
 app.use((req,_,next)=>{ console.log(`[${new Date().toLocaleTimeString()}] ${req.method} ${req.path}`); next(); });
 
 // ─── Rate limiters ────────────────────────────────────────────────────────────
+// NEW: brute-force protection. Without this, /api/auth/admin-login can be hammered
+// with unlimited attempts against ADMIN_KEY, and /api/auth/login can be
+// credential-stuffed against your user base.
 const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 10,
+    windowMs: 15 * 60 * 1000,      // 15 minutes
+    max: 10,                        // 10 attempts per IP per window
     standardHeaders: true,
     legacyHeaders: false,
     message: { message:'Too many attempts. Please try again in a few minutes.' }
 });
 const adminLoginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 5,
+    max: 5,                         // admin key guards the whole store — stricter
     standardHeaders: true,
     legacyHeaders: false,
     message: { message:'Too many attempts. Please try again in a few minutes.' }
 });
 const apiLimiter = rateLimit({
-    windowMs: 1 * 60 * 1000,
-    max: 120,
+    windowMs: 1 * 60 * 1000,       // 1 minute
+    max: 120,                       // generous ceiling for normal browsing/admin polling
     standardHeaders: true,
     legacyHeaders: false,
     message: { message:'Too many requests. Please slow down.' }
 });
-app.use('/api/', apiLimiter);
+app.use('/api/', apiLimiter); // baseline floor across all API routes
 
-app.get('/', (_,res) => res.json({ status: 'ok', message: 'Design Den API Server', frontend: STORE_URL }));
+// ─── Root / health check ──────────────────────────────────────────────────────
+// CHANGED: this backend is API-only — the frontend (design_den_complete.html)
+// and admin panel (admin.html) are deployed separately on Vercel, not served
+// from here. Previously this repo's server.js also tried to serve those HTML
+// files directly via express.static + sendFile, using paths that pointed at
+// the PARENT directory (path.join(__dirname, '..')) — that only works if the
+// HTML files happen to sit one level up from server.js on whatever host runs
+// it, which is a fragile assumption and breaks the moment the deploy layout
+// differs. Since the real frontend is a separate Vercel deployment anyway,
+// none of that serving logic is needed — this route is just a status check.
+app.get('/', (_,res) => res.json({
+    status: 'ok',
+    message: 'Design Den API Server',
+    frontend: STORE_URL // single source of truth — same value used for email links, no separate FRONTEND_URL env var to keep in sync
+}));
 
 // ─── MongoDB ──────────────────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGO_URI, { dbName:'design_den' })
@@ -107,24 +157,34 @@ mongoose.connect(process.env.MONGO_URI, { dbName:'design_den' })
 //  SCHEMAS & MODELS
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// NEW: product variants (e.g. color, weight). Design notes:
+// - A product with an EMPTY variants array behaves exactly as before — top-level
+//   price/stock are authoritative. This keeps every existing product, cart item,
+//   and order record working unchanged.
+// - When variants ARE present, each variant carries its OWN price and stock.
+//   The top-level price/stock on the product become a "starting from" display
+//   value only (e.g. lowest variant price) — see the pre-save hook below.
+// - Each variant gets a stable `variantId` (not Mongo's _id, to keep cart/order
+//   JSON simple and avoid ObjectId-in-frontend headaches) so cart items can
+//   reference "this exact variant of this exact product."
 const variantSchema = new mongoose.Schema({
-    variantId: { type:String, required:true },
-    label:     { type:String, required:true, trim:true },
+    variantId: { type:String, required:true },              // e.g. "red-100g", stable, set once
+    label:     { type:String, required:true, trim:true },   // e.g. "Sunset Red"
     type:      { type:String, default:'option', enum:['color','Types','option'] },
-    swatch:    { type:String, default:'' },
-    img:       { type:String, default:'' },
+    swatch:    { type:String, default:'' },                 // hex color or small image URL for color swatches
+    img:       { type:String, default:'' },                 // optional variant-specific photo (falls back to product img)
     price:     { type:Number, required:true, min:0 },
     stock:     { type:Number, required:true, default:0, min:0 },
     sku:       { type:String, default:'' },
-    active:    { type:Boolean, default:true }
+    active:    { type:Boolean, default:true }                // lets you retire one variant without deleting the product
 }, { _id:false });
 
 const productSchema = new mongoose.Schema({
     name:          { type:String, required:true, trim:true },
-    price:         { type:Number, required:true, min:0 },
+    price:         { type:Number, required:true, min:0 }, // base/display price — see variants note above
     originalPrice: { type:Number, default:null },
     category:      { type:String, required:true, enum:['yarn','kit','hook','Toy','Accessories','Keychains','flower'] },
-    stock:         { type:Number, required:true, default:0, min:0 },
+    stock:         { type:Number, required:true, default:0, min:0 }, // ignored once variants exist — see note above
     rating:        { type:Number, default:4.8, min:1, max:5 },
     reviewCount:   { type:Number, default:0 },
     img:           { type:String, default:'' },
@@ -138,13 +198,18 @@ const productSchema = new mongoose.Schema({
     sku:           { type:String, default:'' },
     weight:        { type:String, default:'' },
     material:      { type:String, default:'' },
-    variants:      { type:[variantSchema], default:[] },
+    variants:      { type:[variantSchema], default:[] }, // NEW
     createdAt:     { type:Date, default:Date.now },
     updatedAt:     { type:Date, default:Date.now }
 });
 productSchema.index({ category:1, active:1 });
 productSchema.index({ name:'text', desc:'text', tags:'text' });
 
+// NEW: keep top-level price/stock in sync as a display/back-compat convenience
+// whenever variants are present — price becomes "lowest variant price" (what
+// you'd show on a product grid card before the customer picks a variant), and
+// stock becomes the sum across active variants (so existing low-stock/out-of-
+// stock UI logic that reads p.stock keeps working without changes).
 productSchema.pre('save', function(next) {
     if (this.variants && this.variants.length) {
         const activeVariants = this.variants.filter(v => v.active);
@@ -152,15 +217,18 @@ productSchema.pre('save', function(next) {
             this.price = Math.min(...activeVariants.map(v => v.price));
             this.stock = activeVariants.reduce((sum, v) => sum + v.stock, 0);
         } else {
-            this.stock = 0;
+            this.stock = 0; // all variants deactivated
         }
     }
     next();
 });
 
+// NEW: saved addresses (multiple, labeled). Kept separate from the legacy
+// `address` field above (Mixed, single) to avoid touching existing data —
+// any old single address stays exactly where it was; this is purely additive.
 const savedAddressSchema = new mongoose.Schema({
     addressId: { type:String, required:true },
-    label:     { type:String, default:'Home' },
+    label:     { type:String, default:'Home' }, // e.g. "Home", "Work"
     name:      { type:String, required:true, trim:true },
     phone:     { type:String, required:true, trim:true },
     line1:     { type:String, required:true, trim:true },
@@ -178,7 +246,7 @@ const userSchema = new mongoose.Schema({
     password:   { type:String, required:true },
     city:       { type:String, default:'' },
     address:    { type:mongoose.Schema.Types.Mixed, default:{} },
-    savedAddresses: { type:[savedAddressSchema], default:[] },
+    savedAddresses: { type:[savedAddressSchema], default:[] }, // NEW
     totalSpent: { type:Number, default:0 },
     orderCount: { type:Number, default:0 },
     createdAt:  { type:Date, default:Date.now }
@@ -198,11 +266,15 @@ const wishlistSchema = new mongoose.Schema({
 });
 
 const orderSchema = new mongoose.Schema({
+    // NEW: userId is now optional — guest checkout orders have no account behind
+    // them. guestEmail/guestPhone are required instead when there's no userId
+    // (enforced in the route, not here, since Mongoose conditional-required
+    // across two paths gets awkward — the route is the single source of truth).
     userId:      { type:mongoose.Schema.Types.ObjectId, ref:'User', default:null },
     guestEmail:  { type:String, default:'', lowercase:true, trim:true },
     guestPhone:  { type:String, default:'', trim:true },
     isGuestOrder:{ type:Boolean, default:false },
-    id:          { type:String, required:true, unique:true },
+    id:          { type:String, required:true, unique:true }, // Format: DD-XXXXXXXXXX
     items:       { type:mongoose.Schema.Types.Mixed, required:true },
     total:       { type:Number, required:true },
     shipping:    { type:Number, default:0 },
@@ -213,11 +285,11 @@ const orderSchema = new mongoose.Schema({
     address:     { type:mongoose.Schema.Types.Mixed },
     payment:     { method:String, txnId:String, razorpayOrderId:String },
     adminNote:   { type:String, default:'' },
-    deliveryDays:{ type:Number, default:2 },
+    deliveryDays:{ type:Number, default:2 }, // Customizable delivery days
     createdAt:   { type:Date, default:Date.now }
 });
 orderSchema.index({ userId:1, createdAt:-1 });
-orderSchema.index({ guestEmail:1, createdAt:-1 });
+orderSchema.index({ guestEmail:1, createdAt:-1 }); // NEW — lets guests look up their orders by email
 orderSchema.index({ status:1 });
 orderSchema.index({ id:1 });
 
@@ -240,10 +312,10 @@ const patternSchema = new mongoose.Schema({
     time:      { type:String, default:'' },
     price:     { type:Number, default:0 },
     img:       { type:String, default:'' },
-    fileUrl:   { type:String, default:'' },
-    driveUrl:  { type:String, default:'' },
-    videoUrl:  { type:String, default:'' },
-    videoData: { type:String, default:'' },
+    fileUrl:   { type:String, default:'' },   // uploaded file as base64
+    driveUrl:  { type:String, default:'' },   // Google Drive / direct URL
+    videoUrl:  { type:String, default:'' },   // YouTube / Drive / Vimeo link
+    videoData: { type:String, default:'' },   // uploaded video as base64
     desc:      { type:String, default:'' },
     downloads: { type:Number, default:0 },
     status:    { type:String, default:'Published', enum:['Published','Draft'] },
@@ -270,7 +342,7 @@ const gallerySchema = new mongoose.Schema({
 });
 
 const commissionSchema = new mongoose.Schema({
-    commissionId: { type:String, required:true, unique:true },
+    commissionId: { type:String, required:true, unique:true }, // e.g. "COMM-2026-XXXX"
     type:         { type:String, required:true, trim:true },
     name:         { type:String, required:true, trim:true },
     phone:        { type:String, required:true, trim:true },
@@ -279,8 +351,36 @@ const commissionSchema = new mongoose.Schema({
     budget:       { type:String, default:'' },
     attachment:   { type:String, default:'' },
     attachName:   { type:String, default:'' },
+    // NEW: 'Accepted' = customer clicked "Accept Quote" but hasn't completed
+    // payment yet (covers the brief in-between window, and lets us recover
+    // gracefully if a payment is abandoned). 'Converting' is a brief, internal-
+    // only transient state used to atomically claim a commission during
+    // payment verification — see POST /commissions/:id/pay/verify — so two
+    // near-simultaneous verify calls can't both create an Order for the same
+    // payment; it should never be visible for more than a few milliseconds in
+    // practice and immediately becomes 'Converted'. 'Converted' = payment
+    // succeeded and a real Order now exists for this commission — at that
+    // point the commission itself is done tracking; the linked Order's own
+    // status (Placed → Confirmed → Processing → Shipped → Out for Delivery →
+    // Delivered) becomes the source of truth shown to the customer, the same
+    // pipeline every regular product order already goes through.
     status:       { type:String, default:'New', enum:['New','Quoted','Accepted','Converting','In Progress','Completed','Converted','Cancelled'] },
     quotedPrice:  { type:Number, default:null },
+    // ═══════════════════════════════════════════════════════════════════════
+    //  NEGOTIATION — dual-approval price agreement
+    // ═══════════════════════════════════════════════════════════════════════
+    // Previously a commission only ever had one quotedPrice, set unilaterally
+    // by the admin, with no way for the customer to push back on it from the
+    // site itself (or for either side to see who actually agreed to what).
+    // Now: quotedPrice is "the price currently on the table", proposedBy
+    // records who put it there, and adminApproved/userApproved each track
+    // whether THAT side has signed off on it. Proposing a new price always
+    // counts as self-approving it (you wouldn't propose a number you don't
+    // want) and resets the OTHER side's approval, since the number changed
+    // out from under them. Only once both flags are true at the same time is
+    // payment allowed — see POST /commissions/:id/accept, which now checks
+    // this instead of just "is there a price at all". negotiationLog is the
+    // full back-and-forth history, shown to both sides for transparency.
     proposedBy:   { type:String, default:null, enum:[null,'admin','user'] },
     adminApproved:{ type:Boolean, default:false },
     userApproved: { type:Boolean, default:false },
@@ -290,9 +390,13 @@ const commissionSchema = new mongoose.Schema({
         message: { type:String, default:'' },
         at:      { type:Date, default:Date.now }
     }],
-    adminNote:    { type:String, default:'' },
-    internalNote: { type:String, default:'' },
+    adminNote:    { type:String, default:'' },   // visible to customer
+    internalNote: { type:String, default:'' },   // admin-only
     completedAt:  { type:Date, default:null },
+    // NEW: once a commission is paid for, this points at the resulting Order's
+    // `id` (not its Mongo _id — the same human-readable DD-XXXXXXXXXX format
+    // every other order uses), so the customer's commission tracker can pull
+    // and display that order's live delivery status instead of going stale.
     linkedOrderId:{ type:String, default:null },
     createdAt:    { type:Date, default:Date.now }
 });
@@ -310,6 +414,10 @@ const settingsSchema = new mongoose.Schema({
     value: { type:mongoose.Schema.Types.Mixed }
 });
 
+// NEW: email failures were previously only console.warn'd — invisible unless
+// someone is actively watching server logs. This schema lets failed sends
+// surface in the admin panel so a missed order confirmation or pattern
+// delivery actually gets noticed and can be manually resent.
 const emailLogSchema = new mongoose.Schema({
     to:        { type:String, required:true },
     subject:   { type:String, required:true },
@@ -337,27 +445,70 @@ const EmailLog    = mongoose.model('EmailLog',    emailLogSchema);
 const razorpay = new Razorpay({ key_id:process.env.RAZORPAY_KEY_ID||'rzp_test_placeholder', key_secret:process.env.RAZORPAY_KEY_SECRET||'placeholder' });
 
 // ─── Email transporter ────────────────────────────────────────────────────────
-// Since all DNS lookups are now forced to IPv4 (see top of file), nodemailer
-// will never attempt an IPv6 connection. No custom lookup hack is needed.
-
-const sgTransport = require('nodemailer-sendgrid-transport');
-
+// NEW: previously this only ever built a Gmail-service transporter — fine if
+// EMAIL_USER is a real Gmail/Google Workspace address using an App Password,
+// but completely silent-broken for anyone using a custom domain, Outlook, or
+// a transactional provider (SES, SendGrid, Mailgun, etc.) via plain SMTP.
+// Every send would fail with no visible symptom beyond an EmailLog entry
+// nothing in the admin UI used to show. Now: if SMTP_HOST is set, use a
+// generic SMTP transport (works with any provider); otherwise fall back to
+// the original Gmail-service behavior for backward compatibility with
+// existing deployments that already had EMAIL_USER/EMAIL_PASS as Gmail
+// credentials and nothing else configured.
 let mailer = null;
-let mailerStatus = { configured: false, ok: null, error: null, checkedAt: null, transport: null };
+// NEW: tracks live transport health so the admin panel can show "is email
+// actually working" instead of the admin only finding out after the fact
+// from a failed-send count with no further detail.
+let mailerStatus = { configured:false, ok:null, error:null, checkedAt:null, transport:null };
+
+// FIXED: Google displays an App Password as 4 groups of 4 characters
+// separated by spaces (e.g. "abcd efgh ijkl mnop") purely for readability —
+// the actual stored credential is those 16 characters with NO spaces. If the
+// password is copied straight from Google's screen (spaces and all) into an
+// env var, every single login attempt fails authentication, because the
+// literal string sent to Gmail's SMTP server doesn't match what Google
+// actually has on file. This silently breaks email with no obvious cause
+// unless you know this specific quirk — stripping all whitespace here makes
+// it work correctly whether the password was copied with or without spaces.
+function _cleanCred(v) { return (v || '').replace(/\s+/g, ''); }
 
 function _initMailer() {
-    if (!process.env.SENDGRID_API_KEY) {
-        console.warn('⚠️  SENDGRID_API_KEY not set – emails disabled.');
-        mailerStatus = { configured:false, ok:false, error:'SENDGRID_API_KEY missing', checkedAt:new Date(), transport:null };
+    if (process.env.SMTP_HOST) {
+        // Generic SMTP — works with any provider (custom domain mailboxes,
+        // SES, SendGrid, Mailgun, Postmark, Zoho, Outlook/Office365, etc).
+        mailer = nodemailer.createTransport({
+            host: process.env.SMTP_HOST,
+            port: parseInt(process.env.SMTP_PORT, 10) || 587,
+            secure: process.env.SMTP_SECURE === 'true', // true for port 465, false for 587/STARTTLS
+            auth: { user: _cleanCred(process.env.SMTP_USER || process.env.EMAIL_USER), pass: _cleanCred(process.env.SMTP_PASS || process.env.EMAIL_PASS) },
+            // NEW: belt-and-suspenders alongside dns.setDefaultResultOrder
+            // above — forces the actual TCP socket to dial out over IPv4 only,
+            // so this specific connection can't hit ENETUNREACH from an IPv6
+            // route even if some other part of the stack ignores the global
+            // DNS order setting.
+            family: 4
+        });
+        mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587})`;
+    } else if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+        // Backward-compatible default: Gmail service shorthand. Requires an
+        // App Password (not a regular account password) when 2FA is on,
+        // which Google effectively requires for SMTP access now — using a
+        // regular password is one of the most common causes of every send
+        // failing with an auth error.
+        mailer = nodemailer.createTransport({
+         host: 'smtp.gmail.com',
+         port: 465,
+         secure: true,
+         auth: { user: _cleanCred(process.env.EMAIL_USER), pass: _cleanCred(process.env.EMAIL_PASS) },
+         family: 4
+     });
+     mailerStatus.transport = `Gmail (${process.env.EMAIL_USER}) via smtp.gmail.com:465`;
+    } else {
+        console.warn('⚠️  No email transport configured — set EMAIL_USER/EMAIL_PASS (Gmail) or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS (any provider) to enable emails.');
+        mailerStatus = { configured:false, ok:false, error:'No EMAIL_USER/EMAIL_PASS or SMTP_HOST configured.', checkedAt:new Date(), transport:null };
         return;
     }
-
-    mailer = nodemailer.createTransport(sgTransport({
-        auth: { api_key: process.env.SENDGRID_API_KEY }
-    }));
     mailerStatus.configured = true;
-    mailerStatus.transport = 'SendGrid (HTTPS API)';
-
     mailer.verify(err => {
         mailerStatus.checkedAt = new Date();
         if (err) {
@@ -367,31 +518,23 @@ function _initMailer() {
         } else {
             mailerStatus.ok = true;
             mailerStatus.error = null;
-            console.log('✅ Email ready – SendGrid via HTTPS');
+            console.log('✅ Email ready —', mailerStatus.transport);
         }
     });
 }
 _initMailer();
 
-const EMAIL_FROM_ADDRESS = process.env.EMAIL_FROM || 'noreply@design-den-studio.vercel.app';
+const EMAIL_FROM_ADDRESS = _cleanCred(process.env.SMTP_USER || process.env.EMAIL_USER);
 
 async function sendMail(to, subject, html) {
-    if (!mailer) {
-        await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (SENDGRID_API_KEY missing)' }).catch(()=>{});
-        return;
-    }
+    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
     try {
-        await mailer.sendMail({
-            from: `"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`,
-            to,
-            subject,
-            html
-        });
+        await mailer.sendMail({ from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html });
         console.log(`📧 Email sent to ${to}`);
         await EmailLog.create({ to, subject, status:'sent' }).catch(()=>{});
-    } catch (err) {
+    } catch(err) {
         console.warn(`⚠️  Email to ${to} failed:`, err.message);
-        await EmailLog.create({ to, subject, status:'failed', error: err.message }).catch(()=>{});
+        await EmailLog.create({ to, subject, status:'failed', error:err.message }).catch(()=>{});
     }
 }
 
@@ -417,6 +560,12 @@ function emailWrap(body) {
 function welcomeEmail(name) {
     return emailWrap(`
     <div style="text-align:center;margin-bottom:32px;">
+      <!-- FIXED: was display:inline-flex + gap — Outlook desktop (Word
+           rendering engine) and several other email clients don't support
+           flexbox at all, so this icon/text/icon row would collapse into 3
+           stacked lines instead of sitting on one line. A table with
+           display:inline-table (not full-width) is the standard, universally-
+           supported way to lay out a few items side-by-side in email HTML. -->
       <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="display:inline-table;background:linear-gradient(135deg,rgba(212,116,140,0.12),rgba(139,50,82,0.08));border:1.5px dashed rgba(212,116,140,0.4);border-radius:999px;margin-bottom:28px;">
         <tr>
           <td style="padding:10px 8px 10px 24px;font-size:0.8rem;white-space:nowrap;">🎀</td>
@@ -447,6 +596,10 @@ function welcomeEmail(name) {
       <a href="${STORE_URL}" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:15px 40px;border-radius:999px;font-weight:800;font-size:0.82rem;letter-spacing:2px;text-transform:uppercase;box-shadow:0 8px 24px rgba(139,50,82,0.25);">START SHOPPING ✦</a>
     </div>
 
+    <!-- FIXED: was display:flex with flex:1 thirds — without flex support the
+         three columns stacked into one tall column instead of sitting side
+         by side. A full-width table with three equal <td>s is the reliable
+         email-safe equivalent of "3 equal flex columns". -->
     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border-top:1px solid rgba(212,116,140,0.15);padding-top:24px;margin-top:4px;">
       <tr>
         <td width="33.33%" align="center" style="text-align:center;padding:0 12px;">
@@ -473,7 +626,165 @@ function welcomeEmail(name) {
     </div>`);
 }
 
-// ... (all other email template functions remain unchanged: patternDeliveryEmail, commissionConfirmEmail, commissionStatusEmail, commissionNegotiationEmail, commissionConvertedEmail, orderStatusEmail, orderConfirmEmail)
+// ═══════════════════════════════════════════════════════════════════════════════
+//  AUTH MIDDLEWARE
+// ═══════════════════════════════════════════════════════════════════════════════
+function auth(req, res, next) {
+    const h = req.headers.authorization;
+    if (!h || !h.startsWith('Bearer ')) return res.status(401).json({ message:'Authentication required' });
+    try {
+        const payload = jwt.verify(h.slice(7), process.env.JWT_SECRET);
+        if (payload.isAdmin) return res.status(403).json({ message:'Use user token' });
+        req.user = payload; next();
+    } catch { res.status(401).json({ message:'Invalid or expired token' }); }
+}
+
+// NEW: optional auth for guest-checkout-capable routes. If a valid user token
+// is present, req.user is set (same as `auth`) and the route can treat the
+// request as a logged-in order. If no token (or an invalid one) is present,
+// req.user stays undefined and the route proceeds as a guest checkout instead
+// of rejecting outright. Admin tokens are still rejected here — admins place
+// orders through the storefront the same as anyone, never "as admin."
+function optionalAuth(req, res, next) {
+    const h = req.headers.authorization;
+    if (!h || !h.startsWith('Bearer ')) { req.user = null; return next(); }
+    try {
+        const payload = jwt.verify(h.slice(7), process.env.JWT_SECRET);
+        if (payload.isAdmin) return res.status(403).json({ message:'Use user token' });
+        req.user = payload;
+    } catch { req.user = null; } // invalid/expired token — fall through as guest rather than blocking
+    next();
+}
+
+function adminAuth(req, res, next) {
+    const adminKey = req.headers['x-admin-key'];
+    if (adminKey && adminKey === process.env.ADMIN_KEY) return next();
+    const h = req.headers.authorization;
+    if (!h || !h.startsWith('Bearer ')) return res.status(401).json({ message:'Admin authentication required' });
+    try {
+        const payload = jwt.verify(h.slice(7), process.env.JWT_SECRET);
+        if (!payload.isAdmin) return res.status(403).json({ message:'Admin access only' });
+        req.user = payload; next();
+    } catch { res.status(401).json({ message:'Invalid admin token' }); }
+}
+
+// ─── Health ───────────────────────────────────────────────────────────────────
+app.get('/api/health', (_,res) => res.json({ status:'ok', ts:Date.now() }));
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PUBLIC ROUTES — Storefront
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Products
+app.get('/api/products', async (req, res) => {
+    try {
+        const { category, search, badge, featured, sort, minPrice, maxPrice, material, inStock } = req.query;
+        const q = { active:true };
+        if (category && category !== 'all') q.category = category;
+        if (badge)    q.badge = badge;
+        if (featured) q.featured = true;
+        if (search) { const re = new RegExp(search.trim(),'i'); q.$or = [{ name:re },{ desc:re },{ tags:re }]; }
+        // NEW: price range filter — operates on the (possibly variant-derived) top-level price
+        if (minPrice || maxPrice) {
+            q.price = {};
+            if (minPrice) q.price.$gte = parseFloat(minPrice);
+            if (maxPrice) q.price.$lte = parseFloat(maxPrice);
+        }
+        // NEW: material filter (cotton, wool, bamboo, etc) — comma-separated for multi-select
+        if (material) {
+            const materials = String(material).split(',').map(m=>m.trim()).filter(Boolean);
+            if (materials.length) q.material = { $in: materials.map(m => new RegExp(`^${m}$`,'i')) };
+        }
+        // NEW: in-stock-only toggle
+        if (inStock === 'true') q.stock = { $gt: 0 };
+
+        let query = Product.find(q).select('-__v');
+        if (sort === 'price_asc')       query = query.sort({ price:1 });
+        else if (sort === 'price_desc') query = query.sort({ price:-1 });
+        else if (sort === 'rating')     query = query.sort({ rating:-1 });
+        else query = query.sort({ createdAt:-1 });
+        res.json({ products: await query });
+    } catch(err) { console.error('[GET /products]',err); res.status(500).json({ message:'Failed to fetch products' }); }
+});
+// NEW: distinct materials across active products, for populating the material
+// filter checkboxes dynamically instead of hardcoding a list in the frontend.
+// IMPORTANT: this must be registered BEFORE /api/products/:id below — Express
+// matches routes in registration order, so /api/products/:id would otherwise
+// intercept this request first, treating "materials" as a product ID and
+// returning 404 (this exact bug existed here until caught by testing).
+app.get('/api/products/materials', async (_,res) => {
+    try {
+        const materials = await Product.distinct('material', { active:true, material:{ $ne:'' } });
+        res.json({ materials: materials.sort() });
+    } catch { res.status(500).json({ message:'Failed to fetch materials' }); }
+});
+app.get('/api/products/:id', async (req, res) => {
+    try {
+        const p = await Product.findById(req.params.id).select('-__v');
+        if (!p || !p.active) return res.status(404).json({ message:'Product not found' });
+        res.json({ product: p });
+    } catch { res.status(404).json({ message:'Product not found' }); }
+});
+
+// Patterns (public)
+app.get('/api/patterns', async (_,res) => {
+    try { res.json({ patterns: await Pattern.find({ status:'Published' }).sort({ createdAt:-1 }).select('-__v -fileUrl -videoData') }); }
+    catch { res.status(500).json({ message:'Error' }); }
+});
+
+// FREE pattern: sends the file via email
+app.post('/api/patterns/:id/download', async (req,res) => {
+    try {
+        const { email, name } = req.body;
+        const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+        if (!email || !emailRx.test(email.trim())) return res.status(400).json({ message:'Please enter a valid email address to receive the pattern.' });
+        const p = await Pattern.findById(req.params.id);
+        if (!p || p.status !== 'Published') return res.status(404).json({ message:'Pattern not found' });
+        if (p.price > 0) return res.status(403).json({ message:'This pattern requires payment. Use the purchase endpoint.' });
+        await Pattern.findByIdAndUpdate(req.params.id, { $inc:{ downloads:1 } });
+        sendPatternMail(email.trim().toLowerCase(), `Your Free Pattern: ${p.name} 📜`, patternDeliveryEmail(p, name||'Crafter', email), p.fileUrl||'', p.name+'.pdf');
+        res.json({ success:true, downloads: (p.downloads||0)+1 });
+    } catch(err) { console.error('[pattern/download]',err); res.status(500).json({ message:'Error' }); }
+});
+
+// PAID pattern: create Razorpay order
+app.post('/api/patterns/:id/purchase-order', async (req,res) => {
+    try {
+        const p = await Pattern.findById(req.params.id);
+        if (!p || p.status !== 'Published') return res.status(404).json({ message:'Pattern not found' });
+        if (!p.price || p.price <= 0) return res.status(400).json({ message:'This pattern is free. Use the download endpoint.' });
+        const { email } = req.body;
+        const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+        if (!email || !emailRx.test(email.trim())) return res.status(400).json({ message:'Please enter your email address.' });
+        
+        // FIX: Razorpay enforces a strict 40-character maximum limit on receipts.
+        const shortTimestamp = Date.now().toString(36);
+        const shortPatternId = p._id.toString().slice(-6);
+        const receiptStr = `PAT_${shortTimestamp}_${shortPatternId}`; // Well under 40 chars
+        
+        const rzpOrder = await razorpay.orders.create({
+            amount: Math.round(p.price * 100),
+            currency: 'INR',
+            receipt: receiptStr,
+            notes: { patternId: p._id.toString(), patternName: p.name, buyerEmail: email.trim().toLowerCase() }
+        });
+        res.json({ orderId: rzpOrder.id, amount: rzpOrder.amount, key: process.env.RAZORPAY_KEY_ID, patternName: p.name });
+    } catch(err) { console.error('[pattern/purchase-order]',err); res.status(500).json({ message:'Payment order creation failed: '+err.message }); }
+});
+
+// PAID pattern: verify payment and deliver via email
+app.post('/api/patterns/:id/verify-purchase', async (req,res) => {
+    try {
+        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, email, name } = req.body;
+        const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+            .update(razorpay_order_id + '|' + razorpay_payment_id).digest('hex');
+        if (expected !== razorpay_signature) return res.status(400).json({ success:false, message:'Payment verification failed. Please contact support.' });
+        const p = await Pattern.findByIdAndUpdate(req.params.id, { $inc:{ downloads:1 } }, { new:true });
+        if (!p) return res.status(404).json({ message:'Pattern not found' });
+        sendPatternMail(email.trim().toLowerCase(), `Your Pattern: ${p.name} 📜`, patternDeliveryEmail(p, name||'Crafter', email, razorpay_payment_id), p.fileUrl||'', p.name+'.pdf');
+        res.json({ success:true, downloads: p.downloads });
+    } catch(err) { console.error('[pattern/verify-purchase]',err); res.status(500).json({ success:false, message:'Delivery failed: '+err.message }); }
+});
 
 function patternDeliveryEmail(p, customerName, email, txnId) {
     const isFree = !p.price || p.price === 0;
@@ -505,6 +816,10 @@ function patternDeliveryEmail(p, customerName, email, txnId) {
       <h2 style="font-family:Georgia,serif;font-size:1.8rem;color:#3D1A0E;margin:0 0 8px;">Hi ${customerName}! Here's Your Pattern ✦</h2>
       <p style="color:rgba(61,26,14,0.55);margin:0;font-size:0.9rem;">${isFree ? 'Enjoy your free download from Design Den!' : 'Thank you for your purchase!'}</p>
     </div>
+    <!-- FIXED: was display:flex (image + text block) — collapsed into two
+         stacked rows in Outlook instead of a thumbnail beside the text.
+         Table layout keeps the thumbnail and text on one row everywhere,
+         and degrades gracefully (just one cell) when there's no image. -->
     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:20px;background:#F7EDE6;border-radius:14px;">
       <tr>
         ${p.img ? `<td width="72" valign="middle" style="padding:14px 0 14px 14px;"><img src="${p.img}" width="72" height="72" style="display:block;width:72px;height:72px;border-radius:10px;object-fit:cover;" alt="${p.name}"></td>` : ''}
@@ -528,7 +843,7 @@ function patternDeliveryEmail(p, customerName, email, txnId) {
 }
 
 async function sendPatternMail(to, subject, html, fileData, fileName) {
-    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured' }).catch(()=>{}); return; }
+    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
     try {
         const mailOpts = { from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html };
         if (fileData && fileData.startsWith('data:')) {
@@ -545,6 +860,403 @@ async function sendPatternMail(to, subject, html, fileData, fileName) {
         await EmailLog.create({ to, subject, status:'failed', error:err.message }).catch(()=>{});
     }
 }
+
+// Testimonials (public)
+app.get('/api/testimonials', async (_,res) => {
+    try { res.json({ testimonials: await Testimonial.find({ status:'Published' }).sort({ createdAt:-1 }).select('-__v') }); }
+    catch { res.status(500).json({ message:'Error' }); }
+});
+app.post('/api/testimonials', async (req,res) => {
+    try {
+        const { name, loc, text, rating } = req.body;
+        if (!name || !name.trim()) return res.status(400).json({ message:'Name is required' });
+        if (!text || text.trim().length < 10) return res.status(400).json({ message:'Review must be at least 10 characters' });
+        const emojis = ['🌸','🐰','✨','🧶','💝','🌅','🎀','🌺','⭐','🦋'];
+        const emoji = emojis[Math.floor(Math.random()*emojis.length)];
+        await Testimonial.create({ name:name.trim(), loc:(loc||'').trim(), text:text.trim(), rating:Math.min(5,Math.max(1,parseInt(rating)||5)), emoji, status:'Pending' });
+        res.status(201).json({ success:true });
+    } catch(err) { console.error('[POST /testimonials]',err); res.status(500).json({ message:'Submission failed' }); }
+});
+
+// Gallery (public)
+app.get('/api/gallery', async (_,res) => {
+    try { res.json({ images: await Gallery.find({ active:true }).sort({ sortOrder:1, createdAt:1 }).select('-__v') }); }
+    catch { res.status(500).json({ message:'Error' }); }
+});
+
+// Commission submit (public)
+app.post('/api/commissions', async (req,res) => {
+    try {
+        const { type, name, phone, email, desc, budget, attachment, attachName } = req.body;
+        const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+        const phoneRx = /^[6-9]\d{9}$/;
+        const cleanPhone = (v='') => v.replace(/\D/g,'').replace(/^0+/,'').replace(/^91/,'');
+        if (!name || name.trim().length < 2)            return res.status(400).json({ message:'Name must be at least 2 characters' });
+        if (!phone || !phoneRx.test(cleanPhone(phone))) return res.status(400).json({ message:'Enter a valid 10-digit Indian mobile number' });
+        if (!email || !emailRx.test(email.trim().toLowerCase())) return res.status(400).json({ message:'Enter a valid email address' });
+        if (!desc || desc.trim().length < 10)           return res.status(400).json({ message:'Please describe your project (at least 10 characters)' });
+
+        // NEW: validate the attachment before storing it. Previously any base64
+        // string was accepted as-is and written straight into MongoDB — no MIME
+        // check, no size cap beyond the global 10mb JSON body limit. A few large
+        // submissions could bloat the database fast, and an unvalidated MIME type
+        // could be misleading if ever rendered/served back out.
+        if (attachment) {
+            const ALLOWED_MIME = ['image/jpeg','image/png','image/webp','image/gif','application/pdf'];
+            const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024; // 5MB — generous for a reference photo or PDF
+            const match = /^data:([^;]+);base64,(.+)$/.exec(attachment);
+            if (!match) return res.status(400).json({ message:'Attachment must be a valid file upload.' });
+            const [, mime, b64] = match;
+            if (!ALLOWED_MIME.includes(mime)) return res.status(400).json({ message:'Attachment must be an image (JPG/PNG/WEBP/GIF) or PDF.' });
+            const approxBytes = Math.ceil(b64.length * 3 / 4);
+            if (approxBytes > MAX_ATTACHMENT_BYTES) return res.status(400).json({ message:'Attachment is too large — please keep it under 5MB.' });
+        }
+
+        const datePart = new Date().toISOString().slice(0,10).replace(/-/g,'');
+        const randPart  = Math.random().toString(36).substring(2,6).toUpperCase();
+        const commissionId = `COMM-${datePart}-${randPart}`;
+        const commission = await Commission.create({
+            commissionId,
+            type:(type||'Custom Design').trim(), name:name.trim(),
+            phone:cleanPhone(phone), email:email.toLowerCase().trim(),
+            desc:desc.trim(), budget:(budget||'').trim(),
+            attachment:attachment||'', attachName:attachName||'', status:'New'
+        });
+        sendMail(commission.email, `Commission Received — ${commissionId} 🎨`, commissionConfirmEmail(commission));
+        res.status(201).json({ success:true, commissionId });
+    } catch(err) { console.error('[POST /commissions]',err); res.status(500).json({ message:'Submission failed' }); }
+});
+
+// NEW: once a commission is paid for and converted into a real Order, the
+// customer-facing tracker should show that Order's live delivery status
+// (Placed → Confirmed → Processing → Shipped → Out for Delivery → Delivered)
+// rather than the stale "Converted" commission status — that's the whole
+// point of converting it into a trackable order in the first place. This
+// helper takes a commission doc (or array of them) and, for any that have a
+// linkedOrderId, fetches that order's status/dates and attaches it as
+// `linkedOrder` so the frontend can render real shipping progress.
+async function attachLinkedOrderStatus(commissionOrList) {
+    const list = Array.isArray(commissionOrList) ? commissionOrList : [commissionOrList];
+    const orderIds = list.map(c => c.linkedOrderId).filter(Boolean);
+    if (!orderIds.length) return commissionOrList;
+    const orders = await Order.find({ id: { $in: orderIds } })
+        .select('id status date deliveryDays createdAt total');
+    const orderMap = new Map(orders.map(o => [o.id, o]));
+    for (const c of list) {
+        if (c.linkedOrderId && orderMap.has(c.linkedOrderId)) {
+            const o = orderMap.get(c.linkedOrderId);
+            c._doc.linkedOrder = { id:o.id, status:o.status, date:o.date, deliveryDays:o.deliveryDays, total:o.total };
+        }
+    }
+    return commissionOrList;
+}
+
+app.get('/api/commissions/track/:commissionId', async (req,res) => {
+    try {
+        const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() })
+            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId proposedBy adminApproved userApproved negotiationLog');
+        if (!c) return res.status(404).json({ message:'Commission not found. Please check your ID.' });
+        await attachLinkedOrderStatus(c);
+        res.json({ commission: c });
+    } catch { res.status(500).json({ message:'Error' }); }
+});
+
+app.post('/api/commissions/track', async (req,res) => {
+    try {
+        const { email } = req.body;
+        const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+        if (!email || !emailRx.test(email.trim().toLowerCase())) return res.status(400).json({ message:'Enter a valid email address' });
+        const commissions = await Commission.find({ email:email.toLowerCase().trim() })
+            .sort({ createdAt:-1 })
+            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId proposedBy adminApproved userApproved negotiationLog');
+        await attachLinkedOrderStatus(commissions);
+        res.json({ commissions });
+    } catch { res.status(500).json({ message:'Error' }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  COMMISSION → ORDER CONVERSION (accept quote, pay, become a tracked order)
+// ═══════════════════════════════════════════════════════════════════════════════
+// This is the missing link between "admin quoted a custom piece" and "customer
+// actually gets it delivered". Previously a Quoted commission just sat there —
+// the customer saw a price in an email/tracker but had no way to act on it, and
+// nothing ever became a real, trackable order. Now: customer accepts the quote
+// and pays for it right from the tracker, which (a) creates a Razorpay order for
+// exactly the quoted amount — never a client-supplied number, same trust model
+// as every other payment in this app — and (b), once that payment is verified,
+// creates a real Order document carrying the commission through the exact same
+// Placed → Confirmed → Processing → Shipped → Out for Delivery → Delivered
+// pipeline as a normal product purchase, fully visible in the admin Orders tab
+// right alongside everything else.
+// ═══════════════════════════════════════════════════════════════════════════
+//  COMMISSION NEGOTIATION — customer side
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/api/commissions/:commissionId/propose', optionalAuth, async (req,res) => {
+    try {
+        const { price, message } = req.body;
+        const p = Number(price);
+        if (!p || p <= 0) return res.status(400).json({ message:'Enter a valid price.' });
+        const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() });
+        if (!c) return res.status(404).json({ message:'Commission not found.' });
+        if (c.status === 'Converted') return res.status(400).json({ message:'This commission has already been paid for and converted into an order.' });
+        if (!c.quotedPrice) return res.status(400).json({ message:'Design Den hasn\'t sent an initial quote yet — please wait for that first.' });
+        c.quotedPrice = p;
+        c.proposedBy = 'user';
+        c.userApproved = true;    // proposing is self-approving
+        c.adminApproved = false; // the number changed — admin needs to weigh in again
+        c.negotiationLog.push({ by:'user', price:p, message: (message||'').trim() });
+        await c.save();
+        if (ADMIN_NOTIFY_EMAIL) sendMail(ADMIN_NOTIFY_EMAIL, `${c.name} Countered — ${c.commissionId} 💬`, commissionNegotiationEmail(c, 'admin'));
+        res.json({ commission:c });
+    } catch(e) { res.status(400).json({ message:e.message }); }
+});
+
+app.post('/api/commissions/:commissionId/approve-quote', optionalAuth, async (req,res) => {
+    try {
+        const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() });
+        if (!c) return res.status(404).json({ message:'Commission not found.' });
+        if (!c.quotedPrice) return res.status(400).json({ message:'There is no price to approve yet.' });
+        if (c.userApproved) return res.json({ commission:c }); // already approved, no-op
+        c.userApproved = true;
+        c.negotiationLog.push({ by:'user', price:c.quotedPrice, message:'Approved' });
+        await c.save();
+        if (ADMIN_NOTIFY_EMAIL) sendMail(ADMIN_NOTIFY_EMAIL, `${c.name} Approved the Price — ${c.commissionId} 👍`, commissionNegotiationEmail(c, 'admin'));
+        res.json({ commission:c });
+    } catch(e) { res.status(400).json({ message:e.message }); }
+});
+
+app.post('/api/commissions/:commissionId/accept', optionalAuth, async (req,res) => {
+    try {
+        const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() });
+        if (!c) return res.status(404).json({ message:'Commission not found.' });
+        if (!['Quoted','Accepted'].includes(c.status)) return res.status(400).json({ message:'This commission does not have an active quote to accept.' });
+        if (!c.quotedPrice || c.quotedPrice <= 0) return res.status(400).json({ message:'No quoted price has been set yet.' });
+        // NEW: payment can only start once BOTH sides have approved the SAME
+        // current price — previously this only checked that a price existed
+        // at all, which meant a customer could pay an admin's opening offer
+        // without any real back-and-forth, and there was no way to actually
+        // negotiate. This is the gate that makes the dual-approval flow real
+        // rather than cosmetic.
+        if (!c.adminApproved || !c.userApproved) {
+            return res.status(400).json({ message:'Both you and Design Den need to approve the current price before payment can start.' });
+        }
+        if (c.status !== 'Accepted') { c.status = 'Accepted'; await c.save(); }
+        // Reuses the exact same Razorpay order-creation shape as /api/payment/create-order,
+        // just sourcing the amount from the commission's quotedPrice instead of a cart total.
+        const rzpOrder = await razorpay.orders.create({
+            amount: Math.round(c.quotedPrice * 100),
+            currency: 'INR',
+            receipt: `DDC_${Date.now().toString(36)}`.slice(0, 40)
+        });
+        res.json({ orderId: rzpOrder.id, key: process.env.RAZORPAY_KEY_ID || 'rzp_test_placeholder', amount: c.quotedPrice });
+    } catch (err) { console.error('[POST /commissions/:id/accept]', err); res.status(500).json({ message:'Could not start payment. Please try again.' }); }
+});
+
+app.post('/api/commissions/:commissionId/pay/verify', optionalAuth, async (req,res) => {
+    try {
+        const commIdUpper = req.params.commissionId.toUpperCase();
+        const c = await Commission.findOne({ commissionId: commIdUpper });
+        if (!c) return res.status(404).json({ message:'Commission not found.' });
+        if (c.status === 'Converted' && c.linkedOrderId) {
+            // Already converted (e.g. a duplicate verify call) — return the existing order rather than erroring or double-creating one.
+            const existing = await Order.findOne({ id: c.linkedOrderId });
+            return res.json({ success:true, order: existing });
+        }
+        if (c.status !== 'Accepted') return res.status(400).json({ message:'This commission is not awaiting payment.' });
+
+        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, address, guestEmail, guestPhone } = req.body;
+        const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+            .update(razorpay_order_id + '|' + razorpay_payment_id).digest('hex');
+        if (expected !== razorpay_signature) return res.status(400).json({ message:'Payment verification failed. Please contact support.' });
+        if (!address || !address.line1 || !address.city || !address.pin) return res.status(400).json({ message:'A delivery address is required.' });
+
+        const isGuest = !req.user;
+        if (isGuest) {
+            const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+            if (!guestEmail || !emailRx.test(String(guestEmail).trim().toLowerCase())) {
+                return res.status(400).json({ message:'A valid email is required.' });
+            }
+        }
+
+        // NEW: atomically claim the conversion before creating the order — same
+        // "conditional update only succeeds once" pattern already used for stock
+        // reservation in POST /api/orders. Without this, two near-simultaneous
+        // verify calls for the same commission (a network retry firing right
+        // after the original handler, for example) could both pass the status
+        // check above before either had written back, and each would go on to
+        // create its own separate Order for the same payment — a duplicate
+        // order, not a double Razorpay charge, but still wrong and confusing
+        // to reconcile. This update only matches (and succeeds) while status
+        // is still exactly 'Accepted', so only one of the two requests can win
+        // the race; the loser falls through to the "already converted" branch.
+        const claimed = await Commission.findOneAndUpdate(
+            { commissionId: commIdUpper, status: 'Accepted' },
+            { status: 'Converting' }, // transient marker, replaced with 'Converted'+linkedOrderId below
+            { new: true }
+        );
+        if (!claimed) {
+            // Lost the race (or status changed underneath us) — re-check: if a
+            // concurrent request already finished converting it, hand back that
+            // order instead of erroring out the customer on what was actually a success.
+            const recheck = await Commission.findOne({ commissionId: commIdUpper });
+            if (recheck && recheck.status === 'Converted' && recheck.linkedOrderId) {
+                const existing = await Order.findOne({ id: recheck.linkedOrderId });
+                return res.json({ success:true, order: existing });
+            }
+            return res.status(409).json({ message:'This commission is already being processed. Please refresh and try again.' });
+        }
+
+        const shipDaysSetting = await Settings.findOne({ key: 'shipping.days' });
+        const defaultDeliveryDays = shipDaysSetting ? parseInt(shipDaysSetting.value, 10) || 2 : 2;
+        const orderId = `DD-${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
+
+        let order;
+        try {
+            // NEW: a commission has no Product document behind it (it's bespoke,
+            // made to order), so its "items" entry is synthetic — just enough
+            // shape for the admin Orders table and customer order-history views
+            // to render something sensible, tagged isCommission so anything that
+            // wants to treat it specially (analytics, stock logic) can detect it
+            // and skip the usual product-stock handling entirely.
+            order = await Order.create({
+                userId: req.user ? req.user.id : null,
+                guestEmail: isGuest ? String(guestEmail).trim().toLowerCase() : '',
+                guestPhone: isGuest ? String(guestPhone || '').trim() : '',
+                isGuestOrder: isGuest,
+                id: orderId,
+                items: [{
+                    _id: 'commission-' + c.commissionId,
+                    name: `Custom Commission — ${c.type}`,
+                    price: c.quotedPrice,
+                    qty: 1,
+                    isCommission: true,
+                    commissionId: c.commissionId
+                }],
+                total: c.quotedPrice,
+                shipping: 0,
+                discount: 0,
+                coupon: null,
+                status: 'Placed',
+                date: new Date().toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }),
+                address,
+                payment: { method:'Online', txnId:razorpay_payment_id, razorpayOrderId:razorpay_order_id },
+                deliveryDays: defaultDeliveryDays
+            });
+        } catch (createErr) {
+            // Order creation failed after claiming the conversion slot — release
+            // the claim back to 'Accepted' so the customer (or a retry) can try
+            // again, rather than leaving the commission stuck in 'Converting' forever.
+            await Commission.findOneAndUpdate({ commissionId: commIdUpper, status: 'Converting' }, { status: 'Accepted' });
+            throw createErr;
+        }
+
+        claimed.status = 'Converted';
+        claimed.linkedOrderId = orderId;
+        await claimed.save();
+        if (req.user) await User.findByIdAndUpdate(req.user.id, { $inc:{ totalSpent:c.quotedPrice, orderCount:1 } });
+
+        sendMail(c.email, `Commission Confirmed & Order Placed — ${orderId} 🎉`, commissionConvertedEmail(c, order));
+        res.status(201).json({ success:true, order });
+    } catch (err) { console.error('[POST /commissions/:id/pay/verify]', err); res.status(500).json({ message:'Payment succeeded but we could not finalize your order — please contact support with your payment ID.' }); }
+});
+
+app.get('/api/user/commissions', auth, async (req,res) => {
+    try {
+        const user = await User.findById(req.user.id).select('email');
+        if (!user) return res.status(404).json({ message:'User not found' });
+        const commissions = await Commission.find({ email: user.email })
+            .sort({ createdAt:-1 })
+            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId proposedBy adminApproved userApproved negotiationLog');
+        await attachLinkedOrderStatus(commissions);
+        res.json({ commissions });
+    } catch { res.status(500).json({ message:'Error' }); }
+});
+
+// ── Saved addresses ───────────────────────────────────────────────────────────
+// NEW: lets returning customers save 2-3 addresses and pick one at checkout
+// instead of retyping every time. CRUD scoped to the logged-in user only.
+app.get('/api/user/addresses', auth, async (req,res) => {
+    try {
+        const user = await User.findById(req.user.id).select('savedAddresses');
+        if (!user) return res.status(404).json({ message:'User not found' });
+        res.json({ addresses: user.savedAddresses || [] });
+    } catch { res.status(500).json({ message:'Failed to fetch addresses' }); }
+});
+
+app.post('/api/user/addresses', auth, async (req,res) => {
+    try {
+        const { label, name, phone, line1, line2, city, state, pin, isDefault } = req.body;
+        if (!name || !phone || !line1 || !city || !state || !pin) {
+            return res.status(400).json({ message:'Name, phone, address line, city, state, and pincode are all required.' });
+        }
+        const pinRx = /^\d{6}$/;
+        if (!pinRx.test(String(pin).trim())) return res.status(400).json({ message:'Pincode must be exactly 6 digits.' });
+
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message:'User not found' });
+
+        // Cap saved addresses at a sane number — this is a convenience feature,
+        // not an address book product. Oldest gets the cap; if the customer
+        // truly needs more than this, they're an edge case worth talking to.
+        if (user.savedAddresses.length >= 10) {
+            return res.status(400).json({ message:'You can save up to 10 addresses. Please delete one before adding another.' });
+        }
+
+        const newAddr = {
+            addressId: `addr-${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`,
+            label: (label||'Home').trim(), name: name.trim(), phone: phone.trim(),
+            line1: line1.trim(), line2: (line2||'').trim(), city: city.trim(),
+            state: state.trim(), pin: String(pin).trim(),
+            isDefault: !!isDefault
+        };
+        // Only one address can be default — unset any existing default if this one claims it
+        if (newAddr.isDefault) user.savedAddresses.forEach(a => a.isDefault = false);
+        // If this is the very first address being saved, make it default automatically
+        if (!user.savedAddresses.length) newAddr.isDefault = true;
+
+        user.savedAddresses.push(newAddr);
+        await user.save();
+        res.status(201).json({ addresses: user.savedAddresses });
+    } catch(e) { res.status(400).json({ message:e.message || 'Failed to save address' }); }
+});
+
+app.put('/api/user/addresses/:addressId', auth, async (req,res) => {
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message:'User not found' });
+        const addr = user.savedAddresses.find(a => a.addressId === req.params.addressId);
+        if (!addr) return res.status(404).json({ message:'Address not found' });
+
+        const { label, name, phone, line1, line2, city, state, pin, isDefault } = req.body;
+        if (pin && !/^\d{6}$/.test(String(pin).trim())) return res.status(400).json({ message:'Pincode must be exactly 6 digits.' });
+
+        if (label!==undefined) addr.label = label.trim();
+        if (name!==undefined)  addr.name  = name.trim();
+        if (phone!==undefined) addr.phone = phone.trim();
+        if (line1!==undefined) addr.line1 = line1.trim();
+        if (line2!==undefined) addr.line2 = line2.trim();
+        if (city!==undefined)  addr.city  = city.trim();
+        if (state!==undefined) addr.state = state.trim();
+        if (pin!==undefined)   addr.pin   = String(pin).trim();
+        if (isDefault) user.savedAddresses.forEach(a => a.isDefault = a.addressId === addr.addressId);
+
+        await user.save();
+        res.json({ addresses: user.savedAddresses });
+    } catch(e) { res.status(400).json({ message:e.message || 'Failed to update address' }); }
+});
+
+app.delete('/api/user/addresses/:addressId', auth, async (req,res) => {
+    try {
+        const user = await User.findById(req.user.id);
+        if (!user) return res.status(404).json({ message:'User not found' });
+        const wasDefault = user.savedAddresses.find(a => a.addressId === req.params.addressId)?.isDefault;
+        user.savedAddresses = user.savedAddresses.filter(a => a.addressId !== req.params.addressId);
+        // If the deleted address was the default and others remain, promote the first one
+        if (wasDefault && user.savedAddresses.length) user.savedAddresses[0].isDefault = true;
+        await user.save();
+        res.json({ addresses: user.savedAddresses });
+    } catch { res.status(500).json({ message:'Failed to delete address' }); }
+});
 
 function commissionConfirmEmail(c) {
     const typeIcon = c.type==='Custom Pattern Only'?'📐':c.type==='Fully Crocheted Piece'?'🧸':c.type==='1-on-1 Workshop'?'📅':'✦';
@@ -595,6 +1307,11 @@ function commissionStatusEmail(c) {
       <h2 style="font-family:Georgia,serif;font-size:1.8rem;color:#3D1A0E;margin:0 0 8px;">${info.title}</h2>
       <p style="color:rgba(61,26,14,0.55);margin:0;font-size:0.9rem;">${info.msg}</p>
     </div>
+    <!-- FIXED: was display:flex justify-content:space-between — without flex
+         support the label and the status pill stacked on top of each other
+         instead of sitting on opposite ends of the row. A 2-column table
+         (left cell align=left, right cell align=right) is the standard
+         email-safe way to replicate "space-between" layout. -->
     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#F7EDE6;border-radius:16px;margin-bottom:20px;">
       <tr>
         <td style="padding:20px 24px;" align="left"><div style="font-size:0.6rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;margin-bottom:4px;">Commission ID</div><div style="font-family:Georgia,serif;font-size:1.3rem;font-weight:700;color:#3D1A0E;">${c.commissionId}</div></td>
@@ -608,6 +1325,12 @@ function commissionStatusEmail(c) {
     </div>`)
 }
 
+// NEW: sent on every negotiation event — a new price proposal from either
+// side, or an approval. `toRole` is who's RECEIVING this email ('admin' or
+// 'user'), so the copy can correctly say "the customer proposed..." vs
+// "Design Den proposed...". Keeps both sides actively informed through the
+// back-and-forth instead of needing to keep refreshing the tracker page to
+// find out whether anything changed.
 function commissionNegotiationEmail(c, toRole) {
     const last = c.negotiationLog[c.negotiationLog.length - 1];
     const otherRole = toRole === 'admin' ? 'user' : 'admin';
@@ -647,6 +1370,11 @@ function commissionNegotiationEmail(c, toRole) {
     </div>`)
 }
 
+
+// NEW: sent the moment a commission's payment is verified and a real Order is
+// created from it. Gives the customer their actual Order ID right away — from
+// this point forward they should think of (and track) this as an order, not a
+// commission, since it now flows through the same Placed → Delivered pipeline.
 function commissionConvertedEmail(c, order) {
     return emailWrap(`
     <div style="text-align:center;margin-bottom:28px;">
@@ -654,6 +1382,8 @@ function commissionConvertedEmail(c, order) {
       <h2 style="font-family:Georgia,serif;font-size:1.8rem;color:#3D1A0E;margin:0 0 8px;">Payment Received — Order Confirmed!</h2>
       <p style="color:rgba(61,26,14,0.55);margin:0;font-size:0.9rem;">Your custom commission is now a confirmed order and will be tracked through to delivery.</p>
     </div>
+    <!-- FIXED: was display:flex justify-content:space-between — see note in
+         commissionStatusEmail above; same table-based fix applied here. -->
     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#F7EDE6;border-radius:16px;margin-bottom:20px;">
       <tr>
         <td style="padding:20px 24px 6px;" align="left"><div style="font-size:0.6rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;margin-bottom:4px;">Order ID</div><div style="font-family:Georgia,serif;font-size:1.3rem;font-weight:700;color:#3D1A0E;">${order.id}</div></td>
@@ -672,6 +1402,12 @@ function commissionConvertedEmail(c, order) {
     </div>`)
 }
 
+// NEW: order status emails. Previously order status changes (Placed →
+// Confirmed → Processing → Shipped → Out for Delivery → Delivered) updated
+// the database but never notified the customer — commissions had status
+// emails and regular orders didn't, which was an inconsistency worth fixing
+// while building out a proper tracked pipeline for converted commissions.
+// Sent from the admin order-status-update route whenever status actually changes.
 function orderStatusEmail(o) {
     const statusMsg = {
         'Confirmed':        { icon:'✅', title:'Order Confirmed!',       msg:'We\'ve confirmed your order and are getting it ready.' },
@@ -688,6 +1424,8 @@ function orderStatusEmail(o) {
       <h2 style="font-family:Georgia,serif;font-size:1.8rem;color:#3D1A0E;margin:0 0 8px;">${info.title}</h2>
       <p style="color:rgba(61,26,14,0.55);margin:0;font-size:0.9rem;">${info.msg}</p>
     </div>
+    <!-- FIXED: was display:flex justify-content:space-between — see note in
+         commissionStatusEmail above; same table-based fix applied here. -->
     <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#F7EDE6;border-radius:16px;margin-bottom:20px;">
       <tr>
         <td style="padding:20px 24px;" align="left"><div style="font-size:0.6rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;margin-bottom:4px;">Order ID</div><div style="font-family:Georgia,serif;font-size:1.3rem;font-weight:700;color:#3D1A0E;">${o.id}</div></td>
@@ -699,539 +1437,6 @@ function orderStatusEmail(o) {
       <a href="${STORE_URL}/#track" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:13px 32px;border-radius:999px;font-weight:800;font-size:0.8rem;letter-spacing:2px;text-transform:uppercase;">Track Your Order →</a>
     </div>`)
 }
-
-function orderConfirmEmail(order, customerName) {
-    const isCOD = order.payment && order.payment.method === 'Cash on Delivery';
-    const itemRows = Array.isArray(order.items) ? order.items.map(item => {
-        const variantLabel = item.variantLabel ? ` — ${item.variantLabel}` : '';
-        return `<tr>
-          <td style="padding:10px 0;border-bottom:1px solid rgba(212,116,140,0.1);font-size:0.82rem;color:#3D1A0E;">${item.name||'Item'}${variantLabel}</td>
-          <td style="padding:10px 0;border-bottom:1px solid rgba(212,116,140,0.1);font-size:0.82rem;color:rgba(61,26,14,0.55);text-align:center;">${item.qty||1}</td>
-          <td style="padding:10px 0;border-bottom:1px solid rgba(212,116,140,0.1);font-size:0.82rem;color:#3D1A0E;text-align:right;">₹${((item.price||0)*(item.qty||1)).toLocaleString('en-IN')}</td>
-        </tr>`;
-    }).join('') : '';
-
-    return emailWrap(`
-    <div style="text-align:center;margin-bottom:28px;">
-      <div style="font-size:3rem;margin-bottom:12px;">🎉</div>
-      <h2 style="font-family:Georgia,serif;font-size:1.8rem;color:#3D1A0E;margin:0 0 8px;">Order Placed Successfully!</h2>
-      <p style="color:rgba(61,26,14,0.55);margin:0;font-size:0.9rem;">${customerName ? `Hi ${customerName}! ` : ''}Thank you for your order — we're on it! 🧶</p>
-    </div>
-    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#F7EDE6;border-radius:16px;margin-bottom:20px;">
-      <tr>
-        <td style="padding:20px 24px;" align="left">
-          <div style="font-size:0.6rem;font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#D4748C;margin-bottom:4px;">Order ID</div>
-          <div style="font-family:Georgia,serif;font-size:1.3rem;font-weight:700;color:#3D1A0E;">${order.id}</div>
-          <div style="font-size:0.72rem;color:rgba(61,26,14,0.4);margin-top:4px;">${order.date || ''}</div>
-        </td>
-        <td style="padding:20px 24px;" align="right" valign="top">
-          <span style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;border-radius:99px;padding:8px 18px;font-size:0.72rem;font-weight:800;letter-spacing:1px;white-space:nowrap;">PLACED ✓</span>
-        </td>
-      </tr>
-    </table>
-
-    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:20px;">
-      <tr>
-        <th style="padding:0 0 8px;font-size:0.65rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:rgba(61,26,14,0.4);text-align:left;">Item</th>
-        <th style="padding:0 0 8px;font-size:0.65rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:rgba(61,26,14,0.4);text-align:center;">Qty</th>
-        <th style="padding:0 0 8px;font-size:0.65rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:rgba(61,26,14,0.4);text-align:right;">Price</th>
-      </tr>
-      ${itemRows}
-    </table>
-
-    <div style="background:#F7EDE6;border-radius:14px;padding:16px 20px;margin-bottom:24px;">
-      ${order.discount > 0 ? `<div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="font-size:0.8rem;color:rgba(61,26,14,0.55);">Subtotal</span><span style="font-size:0.8rem;color:#3D1A0E;">₹${(order.total + order.discount - order.shipping).toLocaleString('en-IN')}</span></div><div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="font-size:0.8rem;color:#7DAA8A;">Discount</span><span style="font-size:0.8rem;color:#7DAA8A;">−₹${order.discount.toLocaleString('en-IN')}</span></div>` : ''}
-      <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="font-size:0.8rem;color:rgba(61,26,14,0.55);">Shipping</span><span style="font-size:0.8rem;color:#3D1A0E;">${order.shipping > 0 ? `₹${order.shipping.toLocaleString('en-IN')}` : 'FREE 🎁'}</span></div>
-      <div style="border-top:1px solid rgba(212,116,140,0.2);margin-top:8px;padding-top:8px;display:flex;justify-content:space-between;"><span style="font-size:0.95rem;font-weight:800;color:#3D1A0E;">Total</span><span style="font-family:Georgia,serif;font-size:1.1rem;font-weight:700;color:#3D1A0E;">₹${order.total.toLocaleString('en-IN')}</span></div>
-      ${isCOD ? `<div style="margin-top:10px;padding:8px 12px;background:rgba(212,116,140,0.1);border-radius:8px;font-size:0.75rem;color:rgba(61,26,14,0.6);text-align:center;">💵 Cash on Delivery — please keep ₹${order.total.toLocaleString('en-IN')} ready at the time of delivery.</div>` : `<div style="margin-top:10px;padding:8px 12px;background:rgba(125,170,138,0.12);border-radius:8px;font-size:0.75rem;color:rgba(61,26,14,0.6);text-align:center;">✅ Payment received online</div>`}
-    </div>
-
-    ${order.address ? `<div style="border:1.5px dashed rgba(212,116,140,0.3);border-radius:14px;padding:16px 20px;margin-bottom:24px;">
-      <div style="font-size:0.6rem;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:#D4748C;margin-bottom:8px;">📍 Delivery Address</div>
-      <div style="font-size:0.82rem;color:#3D1A0E;line-height:1.7;">${order.address.name||''}<br>${order.address.line1||''}${order.address.line2 ? ', '+order.address.line2 : ''}<br>${order.address.city||''}${order.address.state ? ', '+order.address.state : ''}${order.address.pin ? ' — '+order.address.pin : ''}</div>
-    </div>` : ''}
-
-    <div style="text-align:center;margin-bottom:28px;">
-      <a href="${STORE_URL}/#track" style="display:inline-block;background:linear-gradient(135deg,#D4748C,#8B3252);color:white;text-decoration:none;padding:14px 36px;border-radius:999px;font-weight:800;font-size:0.82rem;letter-spacing:2px;text-transform:uppercase;box-shadow:0 8px 24px rgba(139,50,82,0.25);">TRACK YOUR ORDER →</a>
-      <div style="font-size:0.68rem;color:rgba(61,26,14,0.35);margin-top:8px;">Use your Order ID: <strong>${order.id}</strong></div>
-    </div>
-    <div style="text-align:center;padding-top:20px;border-top:1px solid rgba(212,116,140,0.1);">
-      <p style="font-size:0.82rem;color:rgba(61,26,14,0.55);margin:0 0 4px;">With yarn love,</p>
-      <p style="font-family:Georgia,serif;font-size:1.1rem;font-weight:700;color:#D4748C;margin:0;">— The Design Den Team 🧶</p>
-    </div>`);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  AUTH MIDDLEWARE
-// ═══════════════════════════════════════════════════════════════════════════════
-function auth(req, res, next) {
-    const h = req.headers.authorization;
-    if (!h || !h.startsWith('Bearer ')) return res.status(401).json({ message:'Authentication required' });
-    try {
-        const payload = jwt.verify(h.slice(7), process.env.JWT_SECRET);
-        if (payload.isAdmin) return res.status(403).json({ message:'Use user token' });
-        req.user = payload; next();
-    } catch { res.status(401).json({ message:'Invalid or expired token' }); }
-}
-
-function optionalAuth(req, res, next) {
-    const h = req.headers.authorization;
-    if (!h || !h.startsWith('Bearer ')) { req.user = null; return next(); }
-    try {
-        const payload = jwt.verify(h.slice(7), process.env.JWT_SECRET);
-        if (payload.isAdmin) return res.status(403).json({ message:'Use user token' });
-        req.user = payload;
-    } catch { req.user = null; }
-    next();
-}
-
-function adminAuth(req, res, next) {
-    const adminKey = req.headers['x-admin-key'];
-    if (adminKey && adminKey === process.env.ADMIN_KEY) return next();
-    const h = req.headers.authorization;
-    if (!h || !h.startsWith('Bearer ')) return res.status(401).json({ message:'Admin authentication required' });
-    try {
-        const payload = jwt.verify(h.slice(7), process.env.JWT_SECRET);
-        if (!payload.isAdmin) return res.status(403).json({ message:'Admin access only' });
-        req.user = payload; next();
-    } catch { res.status(401).json({ message:'Invalid admin token' }); }
-}
-
-// ─── Health ───────────────────────────────────────────────────────────────────
-app.get('/api/health', (_,res) => res.json({ status:'ok', ts:Date.now() }));
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  PUBLIC ROUTES — Storefront
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// Products
-app.get('/api/products', async (req, res) => {
-    try {
-        const { category, search, badge, featured, sort, minPrice, maxPrice, material, inStock } = req.query;
-        const q = { active:true };
-        if (category && category !== 'all') q.category = category;
-        if (badge)    q.badge = badge;
-        if (featured) q.featured = true;
-        if (search) { const re = new RegExp(search.trim(),'i'); q.$or = [{ name:re },{ desc:re },{ tags:re }]; }
-        if (minPrice || maxPrice) {
-            q.price = {};
-            if (minPrice) q.price.$gte = parseFloat(minPrice);
-            if (maxPrice) q.price.$lte = parseFloat(maxPrice);
-        }
-        if (material) {
-            const materials = String(material).split(',').map(m=>m.trim()).filter(Boolean);
-            if (materials.length) q.material = { $in: materials.map(m => new RegExp(`^${m}$`,'i')) };
-        }
-        if (inStock === 'true') q.stock = { $gt: 0 };
-
-        let query = Product.find(q).select('-__v');
-        if (sort === 'price_asc')       query = query.sort({ price:1 });
-        else if (sort === 'price_desc') query = query.sort({ price:-1 });
-        else if (sort === 'rating')     query = query.sort({ rating:-1 });
-        else query = query.sort({ createdAt:-1 });
-        res.json({ products: await query });
-    } catch(err) { console.error('[GET /products]',err); res.status(500).json({ message:'Failed to fetch products' }); }
-});
-
-app.get('/api/products/materials', async (_,res) => {
-    try {
-        const materials = await Product.distinct('material', { active:true, material:{ $ne:'' } });
-        res.json({ materials: materials.sort() });
-    } catch { res.status(500).json({ message:'Failed to fetch materials' }); }
-});
-
-app.get('/api/products/:id', async (req, res) => {
-    try {
-        const p = await Product.findById(req.params.id).select('-__v');
-        if (!p || !p.active) return res.status(404).json({ message:'Product not found' });
-        res.json({ product: p });
-    } catch { res.status(404).json({ message:'Product not found' }); }
-});
-
-// Patterns (public)
-app.get('/api/patterns', async (_,res) => {
-    try { res.json({ patterns: await Pattern.find({ status:'Published' }).sort({ createdAt:-1 }).select('-__v -fileUrl -videoData') }); }
-    catch { res.status(500).json({ message:'Error' }); }
-});
-
-app.post('/api/patterns/:id/download', async (req,res) => {
-    try {
-        const { email, name } = req.body;
-        const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
-        if (!email || !emailRx.test(email.trim())) return res.status(400).json({ message:'Please enter a valid email address to receive the pattern.' });
-        const p = await Pattern.findById(req.params.id);
-        if (!p || p.status !== 'Published') return res.status(404).json({ message:'Pattern not found' });
-        if (p.price > 0) return res.status(403).json({ message:'This pattern requires payment. Use the purchase endpoint.' });
-        await Pattern.findByIdAndUpdate(req.params.id, { $inc:{ downloads:1 } });
-        sendPatternMail(email.trim().toLowerCase(), `Your Free Pattern: ${p.name} 📜`, patternDeliveryEmail(p, name||'Crafter', email), p.fileUrl||'', p.name+'.pdf');
-        res.json({ success:true, downloads: (p.downloads||0)+1 });
-    } catch(err) { console.error('[pattern/download]',err); res.status(500).json({ message:'Error' }); }
-});
-
-app.post('/api/patterns/:id/purchase-order', async (req,res) => {
-    try {
-        const p = await Pattern.findById(req.params.id);
-        if (!p || p.status !== 'Published') return res.status(404).json({ message:'Pattern not found' });
-        if (!p.price || p.price <= 0) return res.status(400).json({ message:'This pattern is free. Use the download endpoint.' });
-        const { email } = req.body;
-        const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
-        if (!email || !emailRx.test(email.trim())) return res.status(400).json({ message:'Please enter your email address.' });
-        
-        const shortTimestamp = Date.now().toString(36);
-        const shortPatternId = p._id.toString().slice(-6);
-        const receiptStr = `PAT_${shortTimestamp}_${shortPatternId}`;
-        
-        const rzpOrder = await razorpay.orders.create({
-            amount: Math.round(p.price * 100),
-            currency: 'INR',
-            receipt: receiptStr,
-            notes: { patternId: p._id.toString(), patternName: p.name, buyerEmail: email.trim().toLowerCase() }
-        });
-        res.json({ orderId: rzpOrder.id, amount: rzpOrder.amount, key: process.env.RAZORPAY_KEY_ID, patternName: p.name });
-    } catch(err) { console.error('[pattern/purchase-order]',err); res.status(500).json({ message:'Payment order creation failed: '+err.message }); }
-});
-
-app.post('/api/patterns/:id/verify-purchase', async (req,res) => {
-    try {
-        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, email, name } = req.body;
-        const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-            .update(razorpay_order_id + '|' + razorpay_payment_id).digest('hex');
-        if (expected !== razorpay_signature) return res.status(400).json({ success:false, message:'Payment verification failed. Please contact support.' });
-        const p = await Pattern.findByIdAndUpdate(req.params.id, { $inc:{ downloads:1 } }, { new:true });
-        if (!p) return res.status(404).json({ message:'Pattern not found' });
-        sendPatternMail(email.trim().toLowerCase(), `Your Pattern: ${p.name} 📜`, patternDeliveryEmail(p, name||'Crafter', email, razorpay_payment_id), p.fileUrl||'', p.name+'.pdf');
-        res.json({ success:true, downloads: p.downloads });
-    } catch(err) { console.error('[pattern/verify-purchase]',err); res.status(500).json({ success:false, message:'Delivery failed: '+err.message }); }
-});
-
-// Testimonials (public)
-app.get('/api/testimonials', async (_,res) => {
-    try { res.json({ testimonials: await Testimonial.find({ status:'Published' }).sort({ createdAt:-1 }).select('-__v') }); }
-    catch { res.status(500).json({ message:'Error' }); }
-});
-app.post('/api/testimonials', async (req,res) => {
-    try {
-        const { name, loc, text, rating } = req.body;
-        if (!name || !name.trim()) return res.status(400).json({ message:'Name is required' });
-        if (!text || text.trim().length < 10) return res.status(400).json({ message:'Review must be at least 10 characters' });
-        const emojis = ['🌸','🐰','✨','🧶','💝','🌅','🎀','🌺','⭐','🦋'];
-        const emoji = emojis[Math.floor(Math.random()*emojis.length)];
-        await Testimonial.create({ name:name.trim(), loc:(loc||'').trim(), text:text.trim(), rating:Math.min(5,Math.max(1,parseInt(rating)||5)), emoji, status:'Pending' });
-        res.status(201).json({ success:true });
-    } catch(err) { console.error('[POST /testimonials]',err); res.status(500).json({ message:'Submission failed' }); }
-});
-
-// Gallery (public)
-app.get('/api/gallery', async (_,res) => {
-    try { res.json({ images: await Gallery.find({ active:true }).sort({ sortOrder:1, createdAt:1 }).select('-__v') }); }
-    catch { res.status(500).json({ message:'Error' }); }
-});
-
-// Commission submit (public)
-app.post('/api/commissions', async (req,res) => {
-    try {
-        const { type, name, phone, email, desc, budget, attachment, attachName } = req.body;
-        const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
-        const phoneRx = /^[6-9]\d{9}$/;
-        const cleanPhone = (v='') => v.replace(/\D/g,'').replace(/^0+/,'').replace(/^91/,'');
-        if (!name || name.trim().length < 2)            return res.status(400).json({ message:'Name must be at least 2 characters' });
-        if (!phone || !phoneRx.test(cleanPhone(phone))) return res.status(400).json({ message:'Enter a valid 10-digit Indian mobile number' });
-        if (!email || !emailRx.test(email.trim().toLowerCase())) return res.status(400).json({ message:'Enter a valid email address' });
-        if (!desc || desc.trim().length < 10)           return res.status(400).json({ message:'Please describe your project (at least 10 characters)' });
-
-        if (attachment) {
-            const ALLOWED_MIME = ['image/jpeg','image/png','image/webp','image/gif','application/pdf'];
-            const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
-            const match = /^data:([^;]+);base64,(.+)$/.exec(attachment);
-            if (!match) return res.status(400).json({ message:'Attachment must be a valid file upload.' });
-            const [, mime, b64] = match;
-            if (!ALLOWED_MIME.includes(mime)) return res.status(400).json({ message:'Attachment must be an image (JPG/PNG/WEBP/GIF) or PDF.' });
-            const approxBytes = Math.ceil(b64.length * 3 / 4);
-            if (approxBytes > MAX_ATTACHMENT_BYTES) return res.status(400).json({ message:'Attachment is too large — please keep it under 5MB.' });
-        }
-
-        const datePart = new Date().toISOString().slice(0,10).replace(/-/g,'');
-        const randPart  = Math.random().toString(36).substring(2,6).toUpperCase();
-        const commissionId = `COMM-${datePart}-${randPart}`;
-        const commission = await Commission.create({
-            commissionId,
-            type:(type||'Custom Design').trim(), name:name.trim(),
-            phone:cleanPhone(phone), email:email.toLowerCase().trim(),
-            desc:desc.trim(), budget:(budget||'').trim(),
-            attachment:attachment||'', attachName:attachName||'', status:'New'
-        });
-        sendMail(commission.email, `Commission Received — ${commissionId} 🎨`, commissionConfirmEmail(commission));
-        res.status(201).json({ success:true, commissionId });
-    } catch(err) { console.error('[POST /commissions]',err); res.status(500).json({ message:'Submission failed' }); }
-});
-
-async function attachLinkedOrderStatus(commissionOrList) {
-    const list = Array.isArray(commissionOrList) ? commissionOrList : [commissionOrList];
-    const orderIds = list.map(c => c.linkedOrderId).filter(Boolean);
-    if (!orderIds.length) return commissionOrList;
-    const orders = await Order.find({ id: { $in: orderIds } })
-        .select('id status date deliveryDays createdAt total');
-    const orderMap = new Map(orders.map(o => [o.id, o]));
-    for (const c of list) {
-        if (c.linkedOrderId && orderMap.has(c.linkedOrderId)) {
-            const o = orderMap.get(c.linkedOrderId);
-            c._doc.linkedOrder = { id:o.id, status:o.status, date:o.date, deliveryDays:o.deliveryDays, total:o.total };
-        }
-    }
-    return commissionOrList;
-}
-
-app.get('/api/commissions/track/:commissionId', async (req,res) => {
-    try {
-        const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() })
-            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId proposedBy adminApproved userApproved negotiationLog');
-        if (!c) return res.status(404).json({ message:'Commission not found. Please check your ID.' });
-        await attachLinkedOrderStatus(c);
-        res.json({ commission: c });
-    } catch { res.status(500).json({ message:'Error' }); }
-});
-
-app.post('/api/commissions/track', async (req,res) => {
-    try {
-        const { email } = req.body;
-        const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
-        if (!email || !emailRx.test(email.trim().toLowerCase())) return res.status(400).json({ message:'Enter a valid email address' });
-        const commissions = await Commission.find({ email:email.toLowerCase().trim() })
-            .sort({ createdAt:-1 })
-            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId proposedBy adminApproved userApproved negotiationLog');
-        await attachLinkedOrderStatus(commissions);
-        res.json({ commissions });
-    } catch { res.status(500).json({ message:'Error' }); }
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  COMMISSION NEGOTIATION & CONVERSION
-// ═══════════════════════════════════════════════════════════════════════════════
-app.post('/api/commissions/:commissionId/propose', optionalAuth, async (req,res) => {
-    try {
-        const { price, message } = req.body;
-        const p = Number(price);
-        if (!p || p <= 0) return res.status(400).json({ message:'Enter a valid price.' });
-        const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() });
-        if (!c) return res.status(404).json({ message:'Commission not found.' });
-        if (c.status === 'Converted') return res.status(400).json({ message:'This commission has already been paid for and converted into an order.' });
-        if (!c.quotedPrice) return res.status(400).json({ message:'Design Den hasn\'t sent an initial quote yet — please wait for that first.' });
-        c.quotedPrice = p;
-        c.proposedBy = 'user';
-        c.userApproved = true;
-        c.adminApproved = false;
-        c.negotiationLog.push({ by:'user', price:p, message: (message||'').trim() });
-        await c.save();
-        if (ADMIN_NOTIFY_EMAIL) sendMail(ADMIN_NOTIFY_EMAIL, `${c.name} Countered — ${c.commissionId} 💬`, commissionNegotiationEmail(c, 'admin'));
-        res.json({ commission:c });
-    } catch(e) { res.status(400).json({ message:e.message }); }
-});
-
-app.post('/api/commissions/:commissionId/approve-quote', optionalAuth, async (req,res) => {
-    try {
-        const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() });
-        if (!c) return res.status(404).json({ message:'Commission not found.' });
-        if (!c.quotedPrice) return res.status(400).json({ message:'There is no price to approve yet.' });
-        if (c.userApproved) return res.json({ commission:c });
-        c.userApproved = true;
-        c.negotiationLog.push({ by:'user', price:c.quotedPrice, message:'Approved' });
-        await c.save();
-        if (ADMIN_NOTIFY_EMAIL) sendMail(ADMIN_NOTIFY_EMAIL, `${c.name} Approved the Price — ${c.commissionId} 👍`, commissionNegotiationEmail(c, 'admin'));
-        res.json({ commission:c });
-    } catch(e) { res.status(400).json({ message:e.message }); }
-});
-
-app.post('/api/commissions/:commissionId/accept', optionalAuth, async (req,res) => {
-    try {
-        const c = await Commission.findOne({ commissionId: req.params.commissionId.toUpperCase() });
-        if (!c) return res.status(404).json({ message:'Commission not found.' });
-        if (!['Quoted','Accepted'].includes(c.status)) return res.status(400).json({ message:'This commission does not have an active quote to accept.' });
-        if (!c.quotedPrice || c.quotedPrice <= 0) return res.status(400).json({ message:'No quoted price has been set yet.' });
-        if (!c.adminApproved || !c.userApproved) {
-            return res.status(400).json({ message:'Both you and Design Den need to approve the current price before payment can start.' });
-        }
-        if (c.status !== 'Accepted') { c.status = 'Accepted'; await c.save(); }
-        const rzpOrder = await razorpay.orders.create({
-            amount: Math.round(c.quotedPrice * 100),
-            currency: 'INR',
-            receipt: `DDC_${Date.now().toString(36)}`.slice(0, 40)
-        });
-        res.json({ orderId: rzpOrder.id, key: process.env.RAZORPAY_KEY_ID || 'rzp_test_placeholder', amount: c.quotedPrice });
-    } catch (err) { console.error('[POST /commissions/:id/accept]', err); res.status(500).json({ message:'Could not start payment. Please try again.' }); }
-});
-
-app.post('/api/commissions/:commissionId/pay/verify', optionalAuth, async (req,res) => {
-    try {
-        const commIdUpper = req.params.commissionId.toUpperCase();
-        const c = await Commission.findOne({ commissionId: commIdUpper });
-        if (!c) return res.status(404).json({ message:'Commission not found.' });
-        if (c.status === 'Converted' && c.linkedOrderId) {
-            const existing = await Order.findOne({ id: c.linkedOrderId });
-            return res.json({ success:true, order: existing });
-        }
-        if (c.status !== 'Accepted') return res.status(400).json({ message:'This commission is not awaiting payment.' });
-
-        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, address, guestEmail, guestPhone } = req.body;
-        const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-            .update(razorpay_order_id + '|' + razorpay_payment_id).digest('hex');
-        if (expected !== razorpay_signature) return res.status(400).json({ message:'Payment verification failed. Please contact support.' });
-        if (!address || !address.line1 || !address.city || !address.pin) return res.status(400).json({ message:'A delivery address is required.' });
-
-        const isGuest = !req.user;
-        if (isGuest) {
-            const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
-            if (!guestEmail || !emailRx.test(String(guestEmail).trim().toLowerCase())) {
-                return res.status(400).json({ message:'A valid email is required.' });
-            }
-        }
-
-        const claimed = await Commission.findOneAndUpdate(
-            { commissionId: commIdUpper, status: 'Accepted' },
-            { status: 'Converting' },
-            { new: true }
-        );
-        if (!claimed) {
-            const recheck = await Commission.findOne({ commissionId: commIdUpper });
-            if (recheck && recheck.status === 'Converted' && recheck.linkedOrderId) {
-                const existing = await Order.findOne({ id: recheck.linkedOrderId });
-                return res.json({ success:true, order: existing });
-            }
-            return res.status(409).json({ message:'This commission is already being processed. Please refresh and try again.' });
-        }
-
-        const shipDaysSetting = await Settings.findOne({ key: 'shipping.days' });
-        const defaultDeliveryDays = shipDaysSetting ? parseInt(shipDaysSetting.value, 10) || 2 : 2;
-        const orderId = `DD-${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
-
-        let order;
-        try {
-            order = await Order.create({
-                userId: req.user ? req.user.id : null,
-                guestEmail: isGuest ? String(guestEmail).trim().toLowerCase() : '',
-                guestPhone: isGuest ? String(guestPhone || '').trim() : '',
-                isGuestOrder: isGuest,
-                id: orderId,
-                items: [{
-                    _id: 'commission-' + c.commissionId,
-                    name: `Custom Commission — ${c.type}`,
-                    price: c.quotedPrice,
-                    qty: 1,
-                    isCommission: true,
-                    commissionId: c.commissionId
-                }],
-                total: c.quotedPrice,
-                shipping: 0,
-                discount: 0,
-                coupon: null,
-                status: 'Placed',
-                date: new Date().toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }),
-                address,
-                payment: { method:'Online', txnId:razorpay_payment_id, razorpayOrderId:razorpay_order_id },
-                deliveryDays: defaultDeliveryDays
-            });
-        } catch (createErr) {
-            await Commission.findOneAndUpdate({ commissionId: commIdUpper, status: 'Converting' }, { status: 'Accepted' });
-            throw createErr;
-        }
-
-        claimed.status = 'Converted';
-        claimed.linkedOrderId = orderId;
-        await claimed.save();
-        if (req.user) await User.findByIdAndUpdate(req.user.id, { $inc:{ totalSpent:c.quotedPrice, orderCount:1 } });
-
-        sendMail(c.email, `Commission Confirmed & Order Placed — ${orderId} 🎉`, commissionConvertedEmail(c, order));
-        res.status(201).json({ success:true, order });
-    } catch (err) { console.error('[POST /commissions/:id/pay/verify]', err); res.status(500).json({ message:'Payment succeeded but we could not finalize your order — please contact support with your payment ID.' }); }
-});
-
-app.get('/api/user/commissions', auth, async (req,res) => {
-    try {
-        const user = await User.findById(req.user.id).select('email');
-        if (!user) return res.status(404).json({ message:'User not found' });
-        const commissions = await Commission.find({ email: user.email })
-            .sort({ createdAt:-1 })
-            .select('commissionId type name status adminNote quotedPrice createdAt budget completedAt linkedOrderId proposedBy adminApproved userApproved negotiationLog');
-        await attachLinkedOrderStatus(commissions);
-        res.json({ commissions });
-    } catch { res.status(500).json({ message:'Error' }); }
-});
-
-// ── Saved addresses ───────────────────────────────────────────────────────────
-app.get('/api/user/addresses', auth, async (req,res) => {
-    try {
-        const user = await User.findById(req.user.id).select('savedAddresses');
-        if (!user) return res.status(404).json({ message:'User not found' });
-        res.json({ addresses: user.savedAddresses || [] });
-    } catch { res.status(500).json({ message:'Failed to fetch addresses' }); }
-});
-
-app.post('/api/user/addresses', auth, async (req,res) => {
-    try {
-        const { label, name, phone, line1, line2, city, state, pin, isDefault } = req.body;
-        if (!name || !phone || !line1 || !city || !state || !pin) {
-            return res.status(400).json({ message:'Name, phone, address line, city, state, and pincode are all required.' });
-        }
-        const pinRx = /^\d{6}$/;
-        if (!pinRx.test(String(pin).trim())) return res.status(400).json({ message:'Pincode must be exactly 6 digits.' });
-
-        const user = await User.findById(req.user.id);
-        if (!user) return res.status(404).json({ message:'User not found' });
-        if (user.savedAddresses.length >= 10) {
-            return res.status(400).json({ message:'You can save up to 10 addresses. Please delete one before adding another.' });
-        }
-
-        const newAddr = {
-            addressId: `addr-${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}`,
-            label: (label||'Home').trim(), name: name.trim(), phone: phone.trim(),
-            line1: line1.trim(), line2: (line2||'').trim(), city: city.trim(),
-            state: state.trim(), pin: String(pin).trim(),
-            isDefault: !!isDefault
-        };
-        if (newAddr.isDefault) user.savedAddresses.forEach(a => a.isDefault = false);
-        if (!user.savedAddresses.length) newAddr.isDefault = true;
-
-        user.savedAddresses.push(newAddr);
-        await user.save();
-        res.status(201).json({ addresses: user.savedAddresses });
-    } catch(e) { res.status(400).json({ message:e.message || 'Failed to save address' }); }
-});
-
-app.put('/api/user/addresses/:addressId', auth, async (req,res) => {
-    try {
-        const user = await User.findById(req.user.id);
-        if (!user) return res.status(404).json({ message:'User not found' });
-        const addr = user.savedAddresses.find(a => a.addressId === req.params.addressId);
-        if (!addr) return res.status(404).json({ message:'Address not found' });
-
-        const { label, name, phone, line1, line2, city, state, pin, isDefault } = req.body;
-        if (pin && !/^\d{6}$/.test(String(pin).trim())) return res.status(400).json({ message:'Pincode must be exactly 6 digits.' });
-
-        if (label!==undefined) addr.label = label.trim();
-        if (name!==undefined)  addr.name  = name.trim();
-        if (phone!==undefined) addr.phone = phone.trim();
-        if (line1!==undefined) addr.line1 = line1.trim();
-        if (line2!==undefined) addr.line2 = line2.trim();
-        if (city!==undefined)  addr.city  = city.trim();
-        if (state!==undefined) addr.state = state.trim();
-        if (pin!==undefined)   addr.pin   = String(pin).trim();
-        if (isDefault) user.savedAddresses.forEach(a => a.isDefault = a.addressId === addr.addressId);
-
-        await user.save();
-        res.json({ addresses: user.savedAddresses });
-    } catch(e) { res.status(400).json({ message:e.message || 'Failed to update address' }); }
-});
-
-app.delete('/api/user/addresses/:addressId', auth, async (req,res) => {
-    try {
-        const user = await User.findById(req.user.id);
-        if (!user) return res.status(404).json({ message:'User not found' });
-        const wasDefault = user.savedAddresses.find(a => a.addressId === req.params.addressId)?.isDefault;
-        user.savedAddresses = user.savedAddresses.filter(a => a.addressId !== req.params.addressId);
-        if (wasDefault && user.savedAddresses.length) user.savedAddresses[0].isDefault = true;
-        await user.save();
-        res.json({ addresses: user.savedAddresses });
-    } catch { res.status(500).json({ message:'Failed to delete address' }); }
-});
 
 // Coupon validate (public)
 app.post('/api/coupons/validate', async (req,res) => {
@@ -1248,26 +1453,8 @@ app.post('/api/coupons/validate', async (req,res) => {
     } catch { res.status(500).json({ valid:false, message:'Server error' }); }
 });
 
-// Newsletter subscribe (public)
-app.post('/api/subscribe', async (req,res) => {
-    try {
-        const { email } = req.body;
-        const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
-        if (!email || !emailRx.test(email.trim().toLowerCase())) {
-            return res.status(400).json({ message:'Please enter a valid email address' });
-        }
-        const normalised = email.trim().toLowerCase();
-        const existing = await Subscriber.findOne({ email: normalised });
-        if (existing) return res.status(409).json({ message:'You\'re already subscribed — thanks!' });
-        await Subscriber.create({ email: normalised });
-        res.status(201).json({ success:true });
-    } catch(err) {
-        console.error('[POST /subscribe]', err);
-        res.status(500).json({ message:'Subscription failed — please try again.' });
-    }
-});
-
 // Public settings
+
 app.get('/api/settings/public', async (_,res) => {
     try {
         const keys = ['store.name','store.tagline','store.whatsapp','store.instagram','shipping.freeAbove','shipping.fee','shipping.days','shipping.cod','marquee.items'];
@@ -1345,6 +1532,11 @@ async function computeTrustedOrderTotals(items, couponCode) {
     const dbProducts = await Product.find({ _id: { $in: ids } });
     const productMap = new Map(dbProducts.map(p => [String(p._id), p]));
 
+    // NEW: resolves the correct trusted price for a cart item, accounting for
+    // variants. If the item specifies a variantId, the price comes from that
+    // SPECIFIC variant in the DB (never trusting any price the client sent) —
+    // same trust model as before, just variant-aware. Falls back to the
+    // product's own price when there's no variantId (non-variant product).
     function resolveTrustedPrice(product, item) {
         if (item.variantId && product.variants && product.variants.length) {
             const v = product.variants.find(v => v.variantId === item.variantId);
@@ -1403,6 +1595,11 @@ app.get('/api/orders/:orderId', auth, async (req,res) => {
         res.json({ order:o });
     } catch { res.status(500).json({ message:'Server error' }); }
 });
+// NEW: guest order tracking — no account, no login, so lookup is by order ID +
+// the email used at checkout (same pattern as the existing commission tracker).
+// Scoped to guest orders only (isGuestOrder:true) — a guest providing someone's
+// order ID can't use this to peek at a logged-in customer's order, since those
+// don't have guestEmail set and this query filters strictly on it.
 app.post('/api/orders/track', async (req,res) => {
     try {
         const { orderId, email } = req.body;
@@ -1419,11 +1616,28 @@ app.post('/api/orders/track', async (req,res) => {
     } catch { res.status(500).json({ message:'Server error' }); }
 });
 app.post('/api/orders', optionalAuth, async (req,res) => {
-    const reserved = [];
+    // ── Stock handling rewritten: previously stock was decremented AFTER order
+    // creation, in a loop, with no atomicity — two simultaneous orders for the
+    // last unit of a product could both succeed (overselling), and a failed
+    // decrement was only console.warn'd, silently leaving stock wrong forever.
+    // Fix: reserve stock atomically per item BEFORE creating the order, using a
+    // conditional update (stock >= qty) so concurrent requests can't both win.
+    // If any item can't be reserved, roll back everything already reserved and
+    // fail the whole order — no partial/oversold orders.
+    //
+    // NEW (variants): when an item carries a variantId, the reservation targets
+    // that specific variant's stock field inside the variants array, using
+    // Mongo's arrayFilters to update only the matching array element atomically.
+    // Items without a variantId behave exactly as before (product-level stock).
+    const reserved = []; // tracks {productId, variantId|null, qty} successfully decremented, for rollback
     try {
-        const { items, status, date, address, payment, coupon, guestEmail, guestPhone } = req.body;
+        const { items, status, date, address, payment, coupon, guestEmail, guestPhone } = req.body; // Removed client-sent `id`
         if (!items || !items.length) return res.status(400).json({ message:'Missing required fields' });
 
+        // NEW: guest checkout. If there's no logged-in user (req.user is null from
+        // optionalAuth), this order has no account behind it — we still need a way
+        // to reach the customer and let them look up their order later, so email
+        // is required for guests (phone strongly recommended, used for delivery).
         const isGuest = !req.user;
         if (isGuest) {
             const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
@@ -1432,9 +1646,16 @@ app.post('/api/orders', optionalAuth, async (req,res) => {
             }
         }
 
+        // NEW: enforce the shipping.cod admin toggle server-side. The frontend
+        // already hides the Cash on Delivery option when this is disabled, but
+        // that's a UX nicety, not security — anyone can POST directly to this
+        // endpoint regardless of what the checkout UI shows. Checking it here
+        // is what actually prevents a COD order from being created while the
+        // store owner has it turned off (e.g. during the early online-payment-
+        // only phase requested for this launch).
         if (payment && payment.method === 'Cash on Delivery') {
             const codSetting = await Settings.findOne({ key: 'shipping.cod' });
-            const codEnabled = !codSetting || codSetting.value === 'Yes';
+            const codEnabled = !codSetting || codSetting.value === 'Yes'; // default to enabled if unset, matching the seeded default
             if (!codEnabled) {
                 return res.status(400).json({ message:'Cash on Delivery is currently unavailable. Please pay online to complete your order.' });
             }
@@ -1442,6 +1663,7 @@ app.post('/api/orders', optionalAuth, async (req,res) => {
 
         const { subtotal, discount, coupon:appliedCoupon, shipping, total } = await computeTrustedOrderTotals(items, coupon);
 
+        // ── Atomically reserve stock for every item, one at a time ──
         for (const item of items) {
             const pid = item._id || item.productId;
             const variantId = item.variantId || null;
@@ -1455,16 +1677,17 @@ app.post('/api/orders', optionalAuth, async (req,res) => {
                     { $inc: { 'variants.$[v].stock': -qty }, updatedAt: new Date() },
                     { new: true, arrayFilters: [{ 'v.variantId': variantId }] }
                 );
-                if (updated) await updated.save();
+                if (updated) await updated.save(); // re-run pre-save hook to refresh derived top-level stock/price
             } else {
                 updated = await Product.findOneAndUpdate(
-                    { _id: pid, stock: { $gte: qty } },
+                    { _id: pid, stock: { $gte: qty } },        // only matches if enough stock remains
                     { $inc: { stock: -qty }, updatedAt: new Date() },
                     { new: true }
                 );
             }
 
             if (!updated) {
+                // Not enough stock (or product/variant missing) — roll back everything reserved so far
                 for (const r of reserved) {
                     if (r.variantId) {
                         await Product.findOneAndUpdate(
@@ -1488,9 +1711,11 @@ app.post('/api/orders', optionalAuth, async (req,res) => {
             reserved.push({ productId: pid, variantId, qty });
         }
 
+        // Fetch default delivery days from Settings
         const shipDaysSetting = await Settings.findOne({ key: 'shipping.days' });
         const defaultDeliveryDays = shipDaysSetting ? parseInt(shipDaysSetting.value, 10) || 2 : 2;
 
+        // Generate Server-side DD prefix order ID
         const orderId = `DD-${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
 
         let order;
@@ -1513,6 +1738,8 @@ app.post('/api/orders', optionalAuth, async (req,res) => {
                 deliveryDays: defaultDeliveryDays
             });
         } catch (createErr) {
+            // Order creation failed AFTER stock was reserved — roll back stock before re-throwing.
+            // NEW: variant-aware rollback (previously this only handled product-level stock).
             for (const r of reserved) {
                 if (r.variantId) {
                     await Product.findOneAndUpdate(
@@ -1528,21 +1755,8 @@ app.post('/api/orders', optionalAuth, async (req,res) => {
         }
 
         if (appliedCoupon) await Coupon.findOneAndUpdate({ code:appliedCoupon },{ $inc:{ usedCount:1 } });
+        // NEW: only registered accounts accumulate totalSpent/orderCount — guests have no User document
         if (req.user) await User.findByIdAndUpdate(req.user.id, { $inc:{ totalSpent:total, orderCount:1 } });
-
-        try {
-            let toEmail = isGuest ? order.guestEmail : null;
-            let customerName = null;
-            if (!isGuest && req.user) {
-                const u = await User.findById(req.user.id).select('email name');
-                if (u) { toEmail = u.email; customerName = u.name; }
-            }
-            if (toEmail) {
-                sendMail(toEmail, `Order Confirmed — ${order.id} 🧶`, orderConfirmEmail(order, customerName));
-            }
-        } catch (emailErr) {
-            console.warn('[POST /orders] confirmation email error:', emailErr.message);
-        }
 
         res.status(201).json({ order });
     } catch(err) {
@@ -1572,6 +1786,23 @@ app.post('/api/payment/verify', optionalAuth, (req,res) => {
     } catch { res.status(500).json({ success:false, message:'Verification error' }); }
 });
 
+// ── Razorpay webhook — source of truth for payment confirmation ──────────────
+// NEW: previously, order/payment confirmation depended entirely on the browser
+// calling /api/payment/verify after checkout. If the customer closed the tab
+// right after paying (slow network, accidental close, app backgrounded on
+// mobile) but before that call fired, Razorpay would have the money and your
+// DB would never know — order stuck at "Placed" with no payment record.
+//
+// This webhook is called directly by Razorpay's servers (not the browser), so
+// it fires independently of what the customer's device does. Configure the
+// webhook URL in your Razorpay Dashboard → Settings → Webhooks as:
+//   https://yourdomain.com/api/payment/webhook
+// and set RAZORPAY_WEBHOOK_SECRET in your .env to the secret shown there
+// (this is a DIFFERENT secret from RAZORPAY_KEY_SECRET).
+//
+// Uses express.raw() instead of express.json() because Razorpay signs the
+// exact raw request body — re-serializing parsed JSON can produce a different
+// byte string and break signature verification.
 app.post('/api/payment/webhook', express.raw({ type:'application/json' }), async (req,res) => {
     try {
         const signature = req.headers['x-razorpay-signature'];
@@ -1583,6 +1814,8 @@ app.post('/api/payment/webhook', express.raw({ type:'application/json' }), async
         if (expected !== signature) { console.warn('⚠️  Webhook signature mismatch'); return res.status(400).send('Invalid signature'); }
 
         const event = JSON.parse(req.body.toString('utf8'));
+        // Respond fast — Razorpay retries on timeout/non-2xx, so ack immediately,
+        // then process. (Kept synchronous here for simplicity; fine at this scale.)
         if (event.event === 'payment.captured' || event.event === 'order.paid') {
             const rzpOrderId = event.payload?.payment?.entity?.order_id || event.payload?.order?.entity?.id;
             const paymentId  = event.payload?.payment?.entity?.id;
@@ -1598,7 +1831,7 @@ app.post('/api/payment/webhook', express.raw({ type:'application/json' }), async
         res.status(200).send('ok');
     } catch(err) {
         console.error('[payment/webhook]', err);
-        res.status(200).send('ok');
+        res.status(200).send('ok'); // ack anyway — don't let Razorpay retry-storm on our bugs
     }
 });
 
@@ -1621,12 +1854,16 @@ app.get('/api/admin/products', adminAuth, async (req,res) => {
     } catch { res.status(500).json({ message:'Failed to fetch products' }); }
 });
 app.post('/api/admin/products',              adminAuth, async (req,res) => { try{res.status(201).json({product:await Product.create({...req.body,updatedAt:new Date()})});}catch(e){res.status(400).json({message:e.message});} });
+// NEW: switched from findByIdAndUpdate to find+save. findByIdAndUpdate does NOT
+// run Mongoose pre('save') hooks by default — that would silently skip the
+// variant price/stock sync hook above whenever a product was edited via this
+// route, leaving the top-level price/stock stale and out of sync with variants.
 app.put('/api/admin/products/:id', adminAuth, async (req,res) => {
     try {
         const p = await Product.findById(req.params.id);
         if (!p) return res.status(404).json({ message:'Not found' });
         Object.assign(p, req.body, { updatedAt:new Date() });
-        await p.save();
+        await p.save(); // runs validators + the pre-save variant sync hook
         res.json({ product:p });
     } catch(e) { res.status(400).json({ message:e.message }); }
 });
@@ -1636,6 +1873,10 @@ app.patch('/api/admin/products/:id/stock',   adminAuth, async (req,res) => {
         const p = await Product.findById(req.params.id);
         if (!p) return res.status(404).json({ message:'Not found' });
         if (p.variants && p.variants.length) {
+            // NEW: with variants present, top-level stock is a derived sum — editing
+            // it directly here would be silently overwritten by the next save's sync
+            // hook anyway. Point the admin at the correct endpoint instead of letting
+            // them think the edit took effect.
             return res.status(400).json({ message:'This product has variants — update stock per-variant via PATCH /api/admin/products/:id/variants/:variantId/stock' });
         }
         if (delta!==undefined) p.stock=Math.max(0,p.stock+delta);
@@ -1645,6 +1886,9 @@ app.patch('/api/admin/products/:id/stock',   adminAuth, async (req,res) => {
         res.json({ product:p });
     } catch(e) { res.status(400).json({ message:e.message }); }
 });
+// NEW: dedicated route for adjusting a single variant's stock without touching
+// the others. Used by the admin "quick stock update" UI when a product has
+// variants (color/weight options), each tracked independently.
 app.patch('/api/admin/products/:id/variants/:variantId/stock', adminAuth, async (req,res) => {
     try {
         const { stock, delta } = req.body;
@@ -1655,7 +1899,7 @@ app.patch('/api/admin/products/:id/variants/:variantId/stock', adminAuth, async 
         if (delta!==undefined) v.stock = Math.max(0, v.stock + delta);
         else if (stock!==undefined) v.stock = Math.max(0, stock);
         p.updatedAt = new Date();
-        await p.save();
+        await p.save(); // re-syncs top-level stock total via the pre-save hook
         res.json({ product:p });
     } catch(e) { res.status(400).json({ message:e.message }); }
 });
@@ -1678,7 +1922,7 @@ app.get('/api/admin/orders', adminAuth, async (req,res) => {
 });
 app.put('/api/admin/orders/:id/status', adminAuth, async (req,res) => {
     try {
-        const { status, adminNote, deliveryDays } = req.body;
+        const { status, adminNote, deliveryDays } = req.body; // Added deliveryDays override
         const update = { status };
         if (adminNote !== undefined) update.adminNote = adminNote;
         if (deliveryDays !== undefined) update.deliveryDays = deliveryDays;
@@ -1688,6 +1932,12 @@ app.put('/api/admin/orders/:id/status', adminAuth, async (req,res) => {
 
         const order = await Order.findOneAndUpdate({ id:req.params.id }, update, { new:true });
 
+        // NEW: notify the customer on status change — previously this route
+        // silently updated the DB with no email at all, the one inconsistency
+        // left over from before commissions could become real orders (those
+        // already got status emails; plain orders never did). Resolves to the
+        // account email for logged-in customers, or guestEmail for guest
+        // checkouts — same lookup pattern used everywhere else in this file.
         if (status && status !== prev.status) {
             let toEmail = order.guestEmail;
             if (!toEmail && prev.userId) {
@@ -1701,6 +1951,7 @@ app.put('/api/admin/orders/:id/status', adminAuth, async (req,res) => {
     } catch { res.status(500).json({ message:'Failed to update order' }); }
 });
 
+// ── Admin stats ───────────────────────────────────────────────────────────────
 app.get('/api/admin/stats', adminAuth, async (_,res) => {
     try {
         const [products, orders, users, revenueAgg] = await Promise.all([
@@ -1714,31 +1965,36 @@ app.get('/api/admin/stats', adminAuth, async (_,res) => {
         const outStock       = await Product.countDocuments({ active:true, stock:0 });
         const pendingTestis  = await Testimonial.countDocuments({ status:'Pending' });
         const newCommissions = await Commission.countDocuments({ status:'New' });
-        const failedEmails   = await EmailLog.countDocuments({ status:'failed' });
+        const failedEmails   = await EmailLog.countDocuments({ status:'failed' }); // NEW
         res.json({ products, orders, users, lowStock, outStock, revenue:revenueAgg[0]?.total||0, statusCounts:Object.fromEntries(statusCounts.map(s=>[s._id,s.count])), pendingTestis, newCommissions, failedEmails });
     } catch(err) { console.error('[stats]',err); res.status(500).json({ message:'Failed to fetch stats' }); }
 });
 
+// ── Admin coupons ─────────────────────────────────────────────────────────────
 app.get('/api/admin/coupons',        adminAuth, async (_,res)   => { try{res.json({coupons:await Coupon.find().sort({createdAt:-1})});}catch{res.status(500).json({message:'Error'});} });
 app.post('/api/admin/coupons',       adminAuth, async (req,res) => { try{res.status(201).json({coupon:await Coupon.create(req.body)});}catch(e){res.status(400).json({message:e.message});} });
 app.put('/api/admin/coupons/:id',    adminAuth, async (req,res) => { try{const c=await Coupon.findByIdAndUpdate(req.params.id,req.body,{new:true,runValidators:true});if(!c)return res.status(404).json({message:'Not found'});res.json({coupon:c});}catch(e){res.status(400).json({message:e.message});} });
 app.delete('/api/admin/coupons/:id', adminAuth, async (req,res) => { try{await Coupon.findByIdAndDelete(req.params.id);res.json({success:true});}catch{res.status(500).json({message:'Error'});} });
 
+// ── Admin patterns ────────────────────────────────────────────────────────────
 app.get('/api/admin/patterns',        adminAuth, async (_,res)   => { try{res.json({patterns:await Pattern.find().sort({createdAt:-1})});}catch{res.status(500).json({message:'Error'});} });
 app.post('/api/admin/patterns',       adminAuth, async (req,res) => { try{res.status(201).json({pattern:await Pattern.create(req.body)});}catch(e){res.status(400).json({message:e.message});} });
 app.put('/api/admin/patterns/:id',    adminAuth, async (req,res) => { try{const p=await Pattern.findByIdAndUpdate(req.params.id,req.body,{new:true});if(!p)return res.status(404).json({message:'Not found'});res.json({pattern:p});}catch(e){res.status(400).json({message:e.message});} });
 app.delete('/api/admin/patterns/:id', adminAuth, async (req,res) => { try{await Pattern.findByIdAndDelete(req.params.id);res.json({success:true});}catch{res.status(500).json({message:'Error'});} });
 
+// ── Admin testimonials ────────────────────────────────────────────────────────
 app.get('/api/admin/testimonials',        adminAuth, async (_,res)   => { try{res.json({testimonials:await Testimonial.find().sort({createdAt:-1})});}catch{res.status(500).json({message:'Error'});} });
 app.post('/api/admin/testimonials',       adminAuth, async (req,res) => { try{res.status(201).json({testimonial:await Testimonial.create(req.body)});}catch(e){res.status(400).json({message:e.message});} });
 app.put('/api/admin/testimonials/:id',    adminAuth, async (req,res) => { try{const t=await Testimonial.findByIdAndUpdate(req.params.id,req.body,{new:true});if(!t)return res.status(404).json({message:'Not found'});res.json({testimonial:t});}catch(e){res.status(400).json({message:e.message});} });
 app.delete('/api/admin/testimonials/:id', adminAuth, async (req,res) => { try{await Testimonial.findByIdAndDelete(req.params.id);res.json({success:true});}catch{res.status(500).json({message:'Error'});} });
 
+// ── Admin gallery ─────────────────────────────────────────────────────────────
 app.get('/api/admin/gallery',        adminAuth, async (_,res)   => { try{res.json({images:await Gallery.find().sort({sortOrder:1,createdAt:1})});}catch{res.status(500).json({message:'Error'});} });
 app.post('/api/admin/gallery',       adminAuth, async (req,res) => { try{res.status(201).json({image:await Gallery.create(req.body)});}catch(e){res.status(400).json({message:e.message});} });
 app.put('/api/admin/gallery/:id',    adminAuth, async (req,res) => { try{const g=await Gallery.findByIdAndUpdate(req.params.id,req.body,{new:true});if(!g)return res.status(404).json({message:'Not found'});res.json({image:g});}catch(e){res.status(400).json({message:e.message});} });
 app.delete('/api/admin/gallery/:id', adminAuth, async (req,res) => { try{await Gallery.findByIdAndDelete(req.params.id);res.json({success:true});}catch{res.status(500).json({message:'Error'});} });
 
+// ── Admin commissions ─────────────────────────────────────────────────────────
 app.get('/api/admin/commissions', adminAuth, async (req,res) => {
     try {
         const { status } = req.query;
@@ -1752,9 +2008,23 @@ app.put('/api/admin/commissions/:id', adminAuth, async (req,res) => {
     try {
         const prev = await Commission.findById(req.params.id);
         if (!prev) return res.status(404).json({ message:'Not found' });
+        // NEW: once a commission is Converted, it has a real linked Order whose
+        // own status is the source of truth from here on — the admin panel
+        // already locks status/quotedPrice editing in this state (see
+        // viewCommission in admin.html), and this mirrors that server-side so
+        // a direct API call can't silently re-open or re-quote a paid
+        // commission and send a misleading status email about it.
         if (prev.status === 'Converted' && (req.body.status !== undefined || req.body.quotedPrice !== undefined)) {
             return res.status(400).json({ message:'This commission has already been paid for and converted into an order — update the linked order instead.' });
         }
+        // NEW: quotedPrice now flows through the negotiation endpoints below
+        // (POST .../propose and .../approve) instead of this generic update,
+        // since setting it here would change the price on record without
+        // updating proposedBy/adminApproved/userApproved or recording it in
+        // negotiationLog — leaving the two sides' agreement state silently
+        // inconsistent with the actual number. Every other field (status
+        // transitions like Cancelled, internalNote, etc.) still goes through
+        // here as before.
         if (req.body.quotedPrice !== undefined) {
             return res.status(400).json({ message:'Use the Propose Price action to set or change the quoted price.' });
         }
@@ -1770,6 +2040,15 @@ app.put('/api/admin/commissions/:id', adminAuth, async (req,res) => {
     } catch(e) { res.status(400).json({ message:e.message }); }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  COMMISSION NEGOTIATION — admin side
+// ═══════════════════════════════════════════════════════════════════════════
+// NEW: replaces the old "admin sets quotedPrice once, customer either pays or
+// doesn't" model. The admin can now propose a price (first quote, or a
+// counter to whatever the customer last suggested) or simply approve the
+// price the customer most recently proposed — and a real Order is only ever
+// created once BOTH sides have approved the SAME number (see
+// POST /commissions/:id/accept further down, which now gates on this).
 app.post('/api/admin/commissions/:id/propose', adminAuth, async (req,res) => {
     try {
         const { price, message } = req.body;
@@ -1780,8 +2059,8 @@ app.post('/api/admin/commissions/:id/propose', adminAuth, async (req,res) => {
         if (c.status === 'Converted') return res.status(400).json({ message:'This commission has already been paid for and converted into an order.' });
         c.quotedPrice = p;
         c.proposedBy = 'admin';
-        c.adminApproved = true;
-        c.userApproved = false;
+        c.adminApproved = true;   // proposing is self-approving
+        c.userApproved = false;  // the number changed — customer needs to weigh in again
         c.negotiationLog.push({ by:'admin', price:p, message: (message||'').trim() });
         if (c.status === 'New') c.status = 'Quoted';
         await c.save();
@@ -1795,7 +2074,7 @@ app.post('/api/admin/commissions/:id/approve', adminAuth, async (req,res) => {
         const c = await Commission.findById(req.params.id);
         if (!c) return res.status(404).json({ message:'Not found' });
         if (!c.quotedPrice) return res.status(400).json({ message:'There is no price to approve yet.' });
-        if (c.adminApproved) return res.json({ commission:c });
+        if (c.adminApproved) return res.json({ commission:c }); // already approved, no-op
         c.adminApproved = true;
         c.negotiationLog.push({ by:'admin', price:c.quotedPrice, message:'Approved' });
         await c.save();
@@ -1806,20 +2085,30 @@ app.post('/api/admin/commissions/:id/approve', adminAuth, async (req,res) => {
 
 app.delete('/api/admin/commissions/:id', adminAuth, async (req,res) => { try{await Commission.findByIdAndDelete(req.params.id);res.json({success:true});}catch{res.status(500).json({message:'Error'});} });
 
+// ── Admin customers ───────────────────────────────────────────────────────────
 app.get('/api/admin/customers', adminAuth, async (req,res) => {
     try {
         const { search } = req.query;
         const q = search ? { $or:[{ name:new RegExp(search,'i') },{ email:new RegExp(search,'i') }] } : {};
         const users = await User.find(q).select('-password -__v').sort({ createdAt:-1 });
         const counts = await Order.aggregate([{ $group:{ _id:'$userId', count:{ $sum:1 }, total:{ $sum:'$total' } } }]);
+        // NEW: guest orders have userId:null, which now shows up as a `_id: null`
+        // group here. Filter it out before building the lookup map — calling
+        // .toString() on a null _id would otherwise throw and crash this whole
+        // endpoint. Guest orders correctly have no per-user stats to attach to.
         const map = Object.fromEntries(counts.filter(c => c._id).map(c=>[c._id.toString(),c]));
         res.json({ customers: users.map(u => ({ ...u.toObject(), orderCount:map[u._id.toString()]?.count||0, totalSpent:map[u._id.toString()]?.total||0 })) });
     } catch { res.status(500).json({ message:'Failed to fetch customers' }); }
 });
 
+// ── Admin email log ───────────────────────────────────────────────────────────
+// NEW: surfaces failed sends (order confirmations, pattern deliveries, welcome
+// emails, commission updates) so they don't go unnoticed. Most recent first;
+// failures bubbled to the top via sort. Add a UI tab for this in admin.html
+// whenever convenient — for now it's reachable via GET request or curl.
 app.get('/api/admin/email-log', adminAuth, async (req,res) => {
     try {
-        const { status } = req.query;
+        const { status } = req.query; // optional: 'failed' or 'sent'
         const q = status ? { status } : {};
         const logs = await EmailLog.find(q).sort({ createdAt:-1 }).limit(200);
         const failedCount = await EmailLog.countDocuments({ status:'failed' });
@@ -1827,6 +2116,11 @@ app.get('/api/admin/email-log', adminAuth, async (req,res) => {
     } catch { res.status(500).json({ message:'Failed to fetch email log' }); }
 });
 
+// NEW: lets the admin panel show "is email actually working right now"
+// directly — configured/not, last verify result, which transport (Gmail vs
+// custom SMTP) and which address it's sending from — rather than the admin
+// only finding out indirectly from a rising failed-send count with no
+// detail on WHY every send is failing (wrong password, wrong host, etc).
 app.get('/api/admin/email-transport-status', adminAuth, async (req,res) => {
     res.json({
         configured: mailerStatus.configured,
@@ -1838,6 +2132,7 @@ app.get('/api/admin/email-transport-status', adminAuth, async (req,res) => {
     });
 });
 
+// ── Admin settings ────────────────────────────────────────────────────────────
 app.get('/api/admin/settings', adminAuth, async (_,res) => {
     try { const s = await Settings.find(); res.json({ settings:Object.fromEntries(s.map(x=>[x.key,x.value])) }); }
     catch { res.status(500).json({ message:'Server error' }); }
@@ -1849,17 +2144,28 @@ app.put('/api/admin/settings', adminAuth, async (req,res) => {
     } catch { res.status(500).json({ message:'Server error' }); }
 });
 
+// ─── 404 / Error ──────────────────────────────────────────────────────────────
+// NOTE: no path argument here (not '*') — Express 5's router (path-to-regexp v8)
+// rejects the bare '*' wildcard and throws PathError at startup. Express 4 accepts
+// either form, so omitting the path keeps this working regardless of which major
+// version actually gets installed.
 app.use((req,res) => res.status(404).json({ message:`${req.method} ${req.originalUrl} not found` }));
 app.use((err,req,res,_next) => {
+    // NEW: CORS rejections get their own clear response instead of falling
+    // through to the generic 500 below — makes a future origin mismatch
+    // immediately diagnosable from the response itself (and from the
+    // "CORS rejected request from origin" warning already logged above),
+    // rather than looking like an unrelated server crash.
     if (err.message === 'Not allowed by CORS') {
         return res.status(403).json({ message:'This origin is not permitted to access the API.' });
     }
     console.error('[Unhandled]',err); res.status(500).json({ message:'Internal server error' });
 });
 
+// ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, async () => {
     console.log('\n🧶 ══════════════════════════════════════════════');
     console.log(`   Design Den API  →  http://localhost:${PORT}`);
-    console.log('══════════════════════════════════════════════════\n');
-});
+    console.log('══════════════════════════════════════════════════\n');}
+);
