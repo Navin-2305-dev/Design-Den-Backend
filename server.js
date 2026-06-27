@@ -460,103 +460,9 @@ let mailer = null;
 // actually working" instead of the admin only finding out after the fact
 // from a failed-send count with no further detail.
 let mailerStatus = { configured:false, ok:null, error:null, checkedAt:null, transport:null };
-// FIXED: this used to run exactly once at process boot. That's fine as long
-// as EMAIL_USER/EMAIL_PASS (or SMTP_HOST/...) are present in process.env at
-// that exact instant — but on hosts like Render/Railway, env vars are only
-// picked up on a fresh process start. A LOCAL run picks up a local .env file
-// (require('dotenv').config() above) and works fine; the DEPLOYED process
-// only has whatever was actually saved in that host's dashboard. If those
-// two don't match — e.g. EMAIL_USER/EMAIL_PASS exist in a local .env (so
-// welcome emails sent from a local run work) but were never added to the
-// live service's Environment tab — every email sent by the deployed server
-// fails with this exact "Mailer not configured" message, including pattern
-// delivery, even though nothing is wrong with the pattern-sending code
-// itself. `ensureMailer()` below also lets a *running* process self-heal if
-// the vars get added later without a full restart, instead of staying
-// broken until the next deploy.
-let _lastInitAttempt = 0;
-const MAILER_RETRY_COOLDOWN_MS = 60 * 1000; // don't hammer re-init on every send
-// Moved up (used inside _initMailer below, which runs before the line this
-// used to live on — needed earlier now that the Brevo branch reads it too).
-const EMAIL_FROM_ADDRESS = process.env.SMTP_USER || process.env.EMAIL_USER;
-
-// NEW: Brevo's HTTPS Transactional Email API, used as an alternative to a
-// raw SMTP socket. Why this exists: "Mailer not configured" (mailer === null)
-// and "Connection timeout" (mailer exists, but the TCP handshake to
-// smtp.gmail.com never completes) are two DIFFERENT failure modes. The
-// timeout is extremely common when the process sending the mail is a cloud
-// host (Render, Railway, Heroku, AWS, etc) rather than a home/office
-// network — mail providers including Gmail are known to silently
-// throttle/drop inbound SMTP connections (ports 465/587) from datacenter IP
-// ranges to fight spam, with the connection just hanging until it times out,
-// even though the exact same EMAIL_USER/EMAIL_PASS work instantly from a
-// laptop. There is no env-var fix for that — it's the network path itself.
-// Brevo's API sends over a normal HTTPS POST (port 443), which is never
-// blocked the same way, so it sidesteps the whole problem. This returns a
-// minimal object shaped like a nodemailer transport (.sendMail / .verify) so
-// sendMail()/sendPatternMail() below don't need to know which transport is
-// in use.
-function _buildBrevoMailer(apiKey) {
-    return {
-        sendMail: async ({ from, to, subject, html, attachments }) => {
-            const nameMatch = /^"?([^"<]*)"?\s*</.exec(from || '');
-            const senderEmail = (/<([^>]+)>/.exec(from||'')||[])[1] || EMAIL_FROM_ADDRESS;
-            const body = {
-                sender: { name: (nameMatch && nameMatch[1].trim()) || 'Design Den', email: senderEmail },
-                to: [{ email: to }],
-                subject,
-                htmlContent: html
-            };
-            if (attachments && attachments.length) {
-                // nodemailer-shaped {filename, content, encoding:'base64'} →
-                // Brevo-shaped {name, content} (content is the raw base64
-                // string either way — no data: prefix in either format).
-                body.attachment = attachments.map(a => ({ name: a.filename, content: a.content }));
-            }
-            const res = await fetch('https://api.brevo.com/v3/smtp/email', {
-                method: 'POST',
-                headers: { 'api-key': apiKey, 'content-type': 'application/json', accept: 'application/json' },
-                body: JSON.stringify(body)
-            });
-            if (!res.ok) {
-                const errText = await res.text().catch(() => '');
-                throw new Error(`Brevo API ${res.status}: ${errText.slice(0, 300)}`);
-            }
-            return res.json();
-        },
-        // Brevo has no literal "verify SMTP creds" endpoint — hitting the
-        // account endpoint with the API key is the equivalent lightweight
-        // check: it succeeds only if the key itself is valid.
-        verify: (cb) => {
-            fetch('https://api.brevo.com/v3/account', { headers: { 'api-key': apiKey } })
-                .then(res => res.ok ? cb(null) : res.text().then(t => cb(new Error(`Brevo account check failed (${res.status}): ${t.slice(0,200)}`))))
-                .catch(err => cb(err));
-        }
-    };
-}
 
 function _initMailer() {
-    _lastInitAttempt = Date.now();
-    // NEW: prints exactly which of the relevant env vars are present (never
-    // the values themselves) at the moment this process boots, so a missing
-    // var shows up immediately in the host's deploy logs instead of only
-    // surfacing later as a generic "Mailer not configured" EmailLog entry.
-    console.log('📧 Email env check → ' + [
-        ['BREVO_API_KEY', !!process.env.BREVO_API_KEY],
-        ['SMTP_HOST', !!process.env.SMTP_HOST],
-        ['SMTP_USER', !!process.env.SMTP_USER],
-        ['SMTP_PASS', !!process.env.SMTP_PASS],
-        ['EMAIL_USER', !!process.env.EMAIL_USER],
-        ['EMAIL_PASS', !!process.env.EMAIL_PASS],
-    ].map(([k,v]) => `${k}:${v}`).join('  '));
-    if (process.env.BREVO_API_KEY) {
-        // Takes priority over SMTP below: if it's configured, it's almost
-        // always the more reliable choice from a deployed/cloud server (see
-        // comment on _buildBrevoMailer above). To force raw SMTP instead,
-        // remove BREVO_API_KEY from the environment.
-        mailer = _buildBrevoMailer(process.env.BREVO_API_KEY);
-        mailerStatus.transport = `Brevo API (sending as ${EMAIL_FROM_ADDRESS || 'unset — set EMAIL_USER'})`;
-    } else if (process.env.SMTP_HOST) {
+    if (process.env.SMTP_HOST) {
         // Generic SMTP — works with any provider (custom domain mailboxes,
         // SES, SendGrid, Mailgun, Postmark, Zoho, Outlook/Office365, etc).
         mailer = nodemailer.createTransport({
@@ -607,23 +513,10 @@ function _initMailer() {
 }
 _initMailer();
 
-// NEW: called by every send function right before checking `mailer`. If
-// `mailer` is already set, this is a no-op (just returns true). If it's
-// null, instead of permanently giving up, it retries `_initMailer()` — but
-// only once per MAILER_RETRY_COOLDOWN_MS, so a sustained outage doesn't
-// trigger a fresh nodemailer.createTransport()/verify() on every single
-// email send. This means: if EMAIL_USER/EMAIL_PASS or SMTP_HOST get added
-// to the host's env *after* the process already booted (a common fix-it
-// step), email starts working again on the very next send, with no manual
-// restart required.
-function ensureMailer() {
-    if (mailer) return true;
-    if (Date.now() - _lastInitAttempt > MAILER_RETRY_COOLDOWN_MS) _initMailer();
-    return !!mailer;
-}
+const EMAIL_FROM_ADDRESS = process.env.SMTP_USER || process.env.EMAIL_USER;
 
 async function sendMail(to, subject, html) {
-    if (!ensureMailer()) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
+    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
     try {
         await mailer.sendMail({ from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html });
         console.log(`📧 Email sent to ${to}`);
@@ -939,7 +832,7 @@ function patternDeliveryEmail(p, customerName, email, txnId) {
 }
 
 async function sendPatternMail(to, subject, html, fileData, fileName) {
-    if (!ensureMailer()) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
+    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
     try {
         const mailOpts = { from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html };
         if (fileData && fileData.startsWith('data:')) {
@@ -2123,6 +2016,24 @@ app.put('/api/admin/commissions/:id', adminAuth, async (req,res) => {
         // here as before.
         if (req.body.quotedPrice !== undefined) {
             return res.status(400).json({ message:'Use the Propose Price action to set or change the quoted price.' });
+        }
+        // BUGFIX: 'Accepted' must never be set directly by the admin. Per the
+        // schema comment above, 'Accepted' means "the CUSTOMER clicked Accept
+        // Quote and a real Razorpay order now exists for them to pay" — that
+        // payment session is only ever created by POST /commissions/:id/accept
+        // (the customer-facing route). If the admin picks "Accepted" from a
+        // plain status dropdown, the DB status changes and the status email
+        // still goes out promising payment is next, but no Razorpay order was
+        // ever created — the customer's page checks `bothApproved` to decide
+        // whether to show "Pay Now", which was never set either, so they land
+        // on the negotiation panel with nothing to actually pay. That mismatch
+        // (status says Accepted, negotiation panel says "no price proposed
+        // yet" / shows Approve buttons instead of Pay Now) is exactly the bug
+        // this guard closes. If both sides have already approved the price,
+        // the right admin action is /approve (sets adminApproved=true), not a
+        // manual status jump.
+        if (req.body.status === 'Accepted' && prev.status !== 'Accepted') {
+            return res.status(400).json({ message:'"Accepted" can\'t be set manually — it only happens when the customer accepts the quote and starts payment. If you and the customer have agreed on a price, use "Approve Price" in the negotiation panel instead.' });
         }
         const update = { ...req.body };
         if (update.status === 'Completed' && !prev.completedAt) update.completedAt = new Date();
