@@ -15,53 +15,16 @@ const nodemailer  = require('nodemailer');
 const helmet      = require('helmet');             // NEW — security headers (npm i helmet)
 const rateLimit   = require('express-rate-limit');  // NEW — brute-force protection (npm i express-rate-limit)
 
-// Render (and most container platforms) has no outbound IPv6 route at all,
-// so any outbound IPv6 connection attempt fails immediately with ENETUNREACH
-// — even though the exact same connection works instantly over IPv4. This
-// makes IPv4 the preferred order for every outbound DNS lookup that goes
-// through Node's normal dns.lookup() path — Razorpay's HTTPS calls,
-// Mongoose/MongoDB's driver, etc.
-// NOTE: this does NOT cover Nodemailer — see below for why, and for the
-// actual fix for the "connect ENETUNREACH 2404:...:465" email failures.
+// NEW: fixes "connect ENETUNREACH 2404:....:465" email failures. Gmail's SMTP
+// hostname resolves to both an IPv4 and an IPv6 address; Node 18+ tries
+// whichever DNS returns first, and many hosts (Render, most container
+// platforms) have no outbound IPv6 route at all, so any IPv6 attempt fails
+// immediately with ENETUNREACH — even though the exact same connection would
+// work instantly over IPv4. This makes IPv4 the preferred order for every
+// outbound DNS lookup in this process (Gmail/SMTP, Razorpay, anything else
+// that resolves a dual-stack hostname), which is the documented Node fix for
+// this exact class of error.
 dns.setDefaultResultOrder('ipv4first');
-
-// THE ACTUAL EMAIL FIX. Confirmed by tracing Nodemailer's own source
-// (lib/shared/index.js): Nodemailer does NOT use dns.lookup() to resolve SMTP
-// hosts, so dns.setDefaultResultOrder() above never touches it. Instead it
-// creates its own `new dns.Resolver()` and calls resolve4()/resolve6()
-// directly. As of Nodemailer 8.x, when a host has BOTH an A and a AAAA
-// record — which smtp.gmail.com does — it resolves both and picks ONE AT
-// RANDOM for every fresh (uncached) connection. With one IPv4 + one IPv6
-// candidate, that's a coin flip on every send. Locally the coin flip never
-// matters because your ISP routes IPv6 fine either way. On Render, the
-// container's network interface still *reports* IPv6 support to Node (so
-// Nodemailer's own "is IPv6 even available" check passes) even though there
-// is no real upstream IPv6 route — so the ~50% of sends that land on the
-// IPv6 address fail instantly with ENETUNREACH, while the other ~50% go out
-// over IPv4 and succeed. That intermittent split is exactly the "works
-// locally, fails sometimes on Render" pattern. A transport's `family` option
-// can't fix this either — by the time Nodemailer opens the socket it has
-// already replaced the hostname with whichever literal IP it randomly
-// picked, so there's no hostname left for `family` to act on.
-// Fix: patch the same Resolver class Nodemailer instantiates internally so
-// resolve6() always reports "no IPv6 addresses" — which is simply true for
-// this environment — leaving only the IPv4 address for it to pick.
-// Verified directly against Nodemailer 9.x: 30/30 connections resolved to
-// the IPv4 address after this patch, vs. a ~50/50 split before it.
-if (process.env.DISABLE_IPV6 !== 'false') {
-    const refuseIPv6 = (...args) => {
-        const callback = args[args.length - 1];
-        if (typeof callback === 'function') {
-            const err = Object.assign(new Error('IPv6 disabled for this process'), { code:'ENODATA' });
-            process.nextTick(() => callback(err));
-        }
-    };
-    dns.Resolver.prototype.resolve6 = refuseIPv6; // what Nodemailer actually calls
-    dns.resolve6 = refuseIPv6;                    // belt-and-suspenders for any other caller
-    if (dns.promises) {
-        dns.promises.resolve6 = () => Promise.reject(Object.assign(new Error('IPv6 disabled for this process'), { code:'ENODATA' }));
-    }
-}
 
 const app = express();
 
@@ -481,76 +444,53 @@ const EmailLog    = mongoose.model('EmailLog',    emailLogSchema);
 // ─── Razorpay ─────────────────────────────────────────────────────────────────
 const razorpay = new Razorpay({ key_id:process.env.RAZORPAY_KEY_ID||'rzp_test_placeholder', key_secret:process.env.RAZORPAY_KEY_SECRET||'placeholder' });
 
-// ─── Email transport ──────────────────────────────────────────────────────────
-// Three transports are supported, tried in this priority order:
-//   1. Brevo's HTTP API (BREVO_API_KEY set) — sends over plain HTTPS (port
-//      443), which Render's free tier never blocks (blocking it would break
-//      the web server itself). This is the fix for Render's free-tier SMTP
-//      port block: Render blocks outbound traffic on SMTP ports 25/465/587
-//      for free web services (confirmed in Render's own changelog, live
-//      since Sept 26 2025) — no code change can route around a platform
-//      firewall rule, but switching off SMTP entirely sidesteps it.
-//   2. Generic SMTP via SMTP_HOST (any provider) — kept for flexibility if
-//      you move to a paid Render instance (which lifts the port block) or a
-//      host that doesn't restrict SMTP ports.
-//   3. Gmail-service shorthand via EMAIL_USER/EMAIL_PASS — original
-//      backward-compatible default. Still hits Render's free-tier port
-//      block; kept for non-Render deployments / local development only.
-let mailer = null;      // nodemailer transport — only used by modes 2 and 3
-let mailerMode = null;  // 'brevo' | 'smtp' | null (null = not configured)
+// ─── Email transporter ────────────────────────────────────────────────────────
+// NEW: previously this only ever built a Gmail-service transporter — fine if
+// EMAIL_USER is a real Gmail/Google Workspace address using an App Password,
+// but completely silent-broken for anyone using a custom domain, Outlook, or
+// a transactional provider (SES, SendGrid, Mailgun, etc.) via plain SMTP.
+// Every send would fail with no visible symptom beyond an EmailLog entry
+// nothing in the admin UI used to show. Now: if SMTP_HOST is set, use a
+// generic SMTP transport (works with any provider); otherwise fall back to
+// the original Gmail-service behavior for backward compatibility with
+// existing deployments that already had EMAIL_USER/EMAIL_PASS as Gmail
+// credentials and nothing else configured.
+let mailer = null;
 // NEW: tracks live transport health so the admin panel can show "is email
 // actually working" instead of the admin only finding out after the fact
 // from a failed-send count with no further detail.
 let mailerStatus = { configured:false, ok:null, error:null, checkedAt:null, transport:null };
+// FIXED: this used to run exactly once at process boot. That's fine as long
+// as EMAIL_USER/EMAIL_PASS (or SMTP_HOST/...) are present in process.env at
+// that exact instant — but on hosts like Render/Railway, env vars are only
+// picked up on a fresh process start. A LOCAL run picks up a local .env file
+// (require('dotenv').config() above) and works fine; the DEPLOYED process
+// only has whatever was actually saved in that host's dashboard. If those
+// two don't match — e.g. EMAIL_USER/EMAIL_PASS exist in a local .env (so
+// welcome emails sent from a local run work) but were never added to the
+// live service's Environment tab — every email sent by the deployed server
+// fails with this exact "Mailer not configured" message, including pattern
+// delivery, even though nothing is wrong with the pattern-sending code
+// itself. `ensureMailer()` below also lets a *running* process self-heal if
+// the vars get added later without a full restart, instead of staying
+// broken until the next deploy.
+let _lastInitAttempt = 0;
+const MAILER_RETRY_COOLDOWN_MS = 60 * 1000; // don't hammer re-init on every send
 
-const BREVO_API_KEY = process.env.BREVO_API_KEY || '';
-// The address you verified as a "Sender" in Brevo (Settings → Senders).
-// Defaults to EMAIL_USER so existing deployments that just add
-// BREVO_API_KEY (and keep EMAIL_USER set to their verified Gmail address)
-// work with no other env changes.
-const BREVO_SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL || process.env.EMAIL_USER || '';
-const EMAIL_FROM_NAME = process.env.EMAIL_FROM_NAME || 'Design Den 🧶';
-const EMAIL_FROM_ADDRESS = BREVO_API_KEY ? BREVO_SENDER_EMAIL : (process.env.SMTP_USER || process.env.EMAIL_USER);
-
-async function _initMailer() {
-    if (BREVO_API_KEY) {
-        mailerMode = 'brevo';
-        mailerStatus.configured = true;
-        mailerStatus.transport = `Brevo API (sender: ${BREVO_SENDER_EMAIL || 'not set'})`;
-        if (!BREVO_SENDER_EMAIL) {
-            mailerStatus.ok = false;
-            mailerStatus.checkedAt = new Date();
-            mailerStatus.error = 'BREVO_API_KEY is set but no sender email configured — set BREVO_SENDER_EMAIL (or EMAIL_USER) to the address you verified as a Sender in Brevo.';
-            console.warn('⚠️ ', mailerStatus.error);
-            return;
-        }
-        // Lightweight equivalent of nodemailer's mailer.verify() — confirms
-        // the API key is valid without actually sending an email.
-        try {
-            const res = await fetch('https://api.brevo.com/v3/account', {
-                headers: { accept:'application/json', 'api-key':BREVO_API_KEY }
-            });
-            mailerStatus.checkedAt = new Date();
-            if (res.ok) {
-                mailerStatus.ok = true;
-                mailerStatus.error = null;
-                console.log('✅ Email ready —', mailerStatus.transport);
-            } else {
-                mailerStatus.ok = false;
-                mailerStatus.error = `Brevo responded ${res.status} — check that BREVO_API_KEY is a valid v3 API key (not an SMTP key).`;
-                console.warn('⚠️ ', mailerStatus.error);
-            }
-        } catch (err) {
-            mailerStatus.checkedAt = new Date();
-            mailerStatus.ok = false;
-            mailerStatus.error = err.message;
-            console.warn('⚠️  Could not reach Brevo to verify the API key:', err.message);
-        }
-        return;
-    }
-
+function _initMailer() {
+    _lastInitAttempt = Date.now();
+    // NEW: prints exactly which of the relevant env vars are present (never
+    // the values themselves) at the moment this process boots, so a missing
+    // var shows up immediately in the host's deploy logs instead of only
+    // surfacing later as a generic "Mailer not configured" EmailLog entry.
+    console.log('📧 Email env check → ' + [
+        ['SMTP_HOST', !!process.env.SMTP_HOST],
+        ['SMTP_USER', !!process.env.SMTP_USER],
+        ['SMTP_PASS', !!process.env.SMTP_PASS],
+        ['EMAIL_USER', !!process.env.EMAIL_USER],
+        ['EMAIL_PASS', !!process.env.EMAIL_PASS],
+    ].map(([k,v]) => `${k}:${v}`).join('  '));
     if (process.env.SMTP_HOST) {
-        mailerMode = 'smtp';
         // Generic SMTP — works with any provider (custom domain mailboxes,
         // SES, SendGrid, Mailgun, Postmark, Zoho, Outlook/Office365, etc).
         mailer = nodemailer.createTransport({
@@ -558,25 +498,20 @@ async function _initMailer() {
             port: parseInt(process.env.SMTP_PORT, 10) || 587,
             secure: process.env.SMTP_SECURE === 'true', // true for port 465, false for 587/STARTTLS
             auth: { user: process.env.SMTP_USER || process.env.EMAIL_USER, pass: process.env.SMTP_PASS || process.env.EMAIL_PASS },
-            // NOTE: `family: 4` is left here as harmless documentation of
-            // intent, but it does NOT actually prevent the IPv6 ENETUNREACH
-            // issue — Nodemailer resolves the hostname to a literal IP itself
-            // before opening the socket, so there's no hostname left at
-            // connect-time for `family` to influence. The real fix for that
-            // is the dns.Resolver.prototype.resolve6 patch up near the top
-            // of the file. None of this helps with Render's free-tier SMTP
-            // port block though — that's what BREVO_API_KEY is for, above.
+            // NEW: belt-and-suspenders alongside dns.setDefaultResultOrder
+            // above — forces the actual TCP socket to dial out over IPv4 only,
+            // so this specific connection can't hit ENETUNREACH from an IPv6
+            // route even if some other part of the stack ignores the global
+            // DNS order setting.
             family: 4
         });
         mailerStatus.transport = `SMTP (${process.env.SMTP_HOST}:${process.env.SMTP_PORT || 587})`;
     } else if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
-        mailerMode = 'smtp';
         // Backward-compatible default: Gmail service shorthand. Requires an
         // App Password (not a regular account password) when 2FA is on,
         // which Google effectively requires for SMTP access now — using a
         // regular password is one of the most common causes of every send
-        // failing with an auth error. NOTE: hits Render's free-tier SMTP
-        // port block — use BREVO_API_KEY instead if you're on Render free tier.
+        // failing with an auth error.
         mailer = nodemailer.createTransport({
          host: 'smtp.gmail.com',
          port: 465,
@@ -586,8 +521,8 @@ async function _initMailer() {
      });
      mailerStatus.transport = `Gmail (${process.env.EMAIL_USER}) via smtp.gmail.com:465`;
     } else {
-        console.warn('⚠️  No email transport configured — set BREVO_API_KEY (recommended on Render), or EMAIL_USER/EMAIL_PASS, or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS, to enable emails.');
-        mailerStatus = { configured:false, ok:false, error:'No BREVO_API_KEY, EMAIL_USER/EMAIL_PASS, or SMTP_HOST configured.', checkedAt:new Date(), transport:null };
+        console.warn('⚠️  No email transport configured — set EMAIL_USER/EMAIL_PASS (Gmail) or SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS (any provider) to enable emails.');
+        mailerStatus = { configured:false, ok:false, error:'No EMAIL_USER/EMAIL_PASS or SMTP_HOST configured.', checkedAt:new Date(), transport:null };
         return;
     }
     mailerStatus.configured = true;
@@ -606,45 +541,27 @@ async function _initMailer() {
 }
 _initMailer();
 
-// Sends one email through whichever transport ended up active. `attachment`,
-// when given, is in nodemailer's shape ({filename, content, encoding,
-// contentType}) and gets translated into Brevo's shape ({name, content})
-// when mailerMode is 'brevo' — this lets sendMail() and sendPatternMail()
-// share one dispatcher without either needing to know which transport is live.
-async function _dispatchMail(to, subject, html, attachment) {
-    if (mailerMode === 'brevo') {
-        const payload = {
-            sender: { name: EMAIL_FROM_NAME, email: EMAIL_FROM_ADDRESS },
-            to: [{ email: to }],
-            subject,
-            htmlContent: html
-        };
-        if (attachment) {
-            payload.attachment = [{ name: attachment.filename, content: attachment.content }];
-        }
-        const res = await fetch('https://api.brevo.com/v3/smtp/email', {
-            method: 'POST',
-            headers: { accept:'application/json', 'content-type':'application/json', 'api-key':BREVO_API_KEY },
-            body: JSON.stringify(payload)
-        });
-        if (!res.ok) {
-            const body = await res.text().catch(() => '');
-            throw new Error(`Brevo ${res.status}: ${body.slice(0, 300)}`);
-        }
-        return;
-    }
-    if (mailerMode === 'smtp') {
-        const mailOpts = { from:`"${EMAIL_FROM_NAME}" <${EMAIL_FROM_ADDRESS}>`, to, subject, html };
-        if (attachment) mailOpts.attachments = [attachment];
-        await mailer.sendMail(mailOpts);
-        return;
-    }
-    throw new Error('Mailer not configured (set BREVO_API_KEY, EMAIL_USER/EMAIL_PASS, or SMTP_HOST)');
+// NEW: called by every send function right before checking `mailer`. If
+// `mailer` is already set, this is a no-op (just returns true). If it's
+// null, instead of permanently giving up, it retries `_initMailer()` — but
+// only once per MAILER_RETRY_COOLDOWN_MS, so a sustained outage doesn't
+// trigger a fresh nodemailer.createTransport()/verify() on every single
+// email send. This means: if EMAIL_USER/EMAIL_PASS or SMTP_HOST get added
+// to the host's env *after* the process already booted (a common fix-it
+// step), email starts working again on the very next send, with no manual
+// restart required.
+function ensureMailer() {
+    if (mailer) return true;
+    if (Date.now() - _lastInitAttempt > MAILER_RETRY_COOLDOWN_MS) _initMailer();
+    return !!mailer;
 }
 
+const EMAIL_FROM_ADDRESS = process.env.SMTP_USER || process.env.EMAIL_USER;
+
 async function sendMail(to, subject, html) {
+    if (!ensureMailer()) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
     try {
-        await _dispatchMail(to, subject, html);
+        await mailer.sendMail({ from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html });
         console.log(`📧 Email sent to ${to}`);
         await EmailLog.create({ to, subject, status:'sent' }).catch(()=>{});
     } catch(err) {
@@ -958,7 +875,7 @@ function patternDeliveryEmail(p, customerName, email, txnId) {
 }
 
 async function sendPatternMail(to, subject, html, fileData, fileName) {
-    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
+    if (!ensureMailer()) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
     try {
         const mailOpts = { from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html };
         if (fileData && fileData.startsWith('data:')) {
