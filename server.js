@@ -476,6 +476,64 @@ let mailerStatus = { configured:false, ok:null, error:null, checkedAt:null, tran
 // broken until the next deploy.
 let _lastInitAttempt = 0;
 const MAILER_RETRY_COOLDOWN_MS = 60 * 1000; // don't hammer re-init on every send
+// Moved up (used inside _initMailer below, which runs before the line this
+// used to live on — needed earlier now that the Brevo branch reads it too).
+const EMAIL_FROM_ADDRESS = process.env.SMTP_USER || process.env.EMAIL_USER;
+
+// NEW: Brevo's HTTPS Transactional Email API, used as an alternative to a
+// raw SMTP socket. Why this exists: "Mailer not configured" (mailer === null)
+// and "Connection timeout" (mailer exists, but the TCP handshake to
+// smtp.gmail.com never completes) are two DIFFERENT failure modes. The
+// timeout is extremely common when the process sending the mail is a cloud
+// host (Render, Railway, Heroku, AWS, etc) rather than a home/office
+// network — mail providers including Gmail are known to silently
+// throttle/drop inbound SMTP connections (ports 465/587) from datacenter IP
+// ranges to fight spam, with the connection just hanging until it times out,
+// even though the exact same EMAIL_USER/EMAIL_PASS work instantly from a
+// laptop. There is no env-var fix for that — it's the network path itself.
+// Brevo's API sends over a normal HTTPS POST (port 443), which is never
+// blocked the same way, so it sidesteps the whole problem. This returns a
+// minimal object shaped like a nodemailer transport (.sendMail / .verify) so
+// sendMail()/sendPatternMail() below don't need to know which transport is
+// in use.
+function _buildBrevoMailer(apiKey) {
+    return {
+        sendMail: async ({ from, to, subject, html, attachments }) => {
+            const nameMatch = /^"?([^"<]*)"?\s*</.exec(from || '');
+            const senderEmail = (/<([^>]+)>/.exec(from||'')||[])[1] || EMAIL_FROM_ADDRESS;
+            const body = {
+                sender: { name: (nameMatch && nameMatch[1].trim()) || 'Design Den', email: senderEmail },
+                to: [{ email: to }],
+                subject,
+                htmlContent: html
+            };
+            if (attachments && attachments.length) {
+                // nodemailer-shaped {filename, content, encoding:'base64'} →
+                // Brevo-shaped {name, content} (content is the raw base64
+                // string either way — no data: prefix in either format).
+                body.attachment = attachments.map(a => ({ name: a.filename, content: a.content }));
+            }
+            const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+                method: 'POST',
+                headers: { 'api-key': apiKey, 'content-type': 'application/json', accept: 'application/json' },
+                body: JSON.stringify(body)
+            });
+            if (!res.ok) {
+                const errText = await res.text().catch(() => '');
+                throw new Error(`Brevo API ${res.status}: ${errText.slice(0, 300)}`);
+            }
+            return res.json();
+        },
+        // Brevo has no literal "verify SMTP creds" endpoint — hitting the
+        // account endpoint with the API key is the equivalent lightweight
+        // check: it succeeds only if the key itself is valid.
+        verify: (cb) => {
+            fetch('https://api.brevo.com/v3/account', { headers: { 'api-key': apiKey } })
+                .then(res => res.ok ? cb(null) : res.text().then(t => cb(new Error(`Brevo account check failed (${res.status}): ${t.slice(0,200)}`))))
+                .catch(err => cb(err));
+        }
+    };
+}
 
 function _initMailer() {
     _lastInitAttempt = Date.now();
@@ -484,13 +542,21 @@ function _initMailer() {
     // var shows up immediately in the host's deploy logs instead of only
     // surfacing later as a generic "Mailer not configured" EmailLog entry.
     console.log('📧 Email env check → ' + [
+        ['BREVO_API_KEY', !!process.env.BREVO_API_KEY],
         ['SMTP_HOST', !!process.env.SMTP_HOST],
         ['SMTP_USER', !!process.env.SMTP_USER],
         ['SMTP_PASS', !!process.env.SMTP_PASS],
         ['EMAIL_USER', !!process.env.EMAIL_USER],
         ['EMAIL_PASS', !!process.env.EMAIL_PASS],
     ].map(([k,v]) => `${k}:${v}`).join('  '));
-    if (process.env.SMTP_HOST) {
+    if (process.env.BREVO_API_KEY) {
+        // Takes priority over SMTP below: if it's configured, it's almost
+        // always the more reliable choice from a deployed/cloud server (see
+        // comment on _buildBrevoMailer above). To force raw SMTP instead,
+        // remove BREVO_API_KEY from the environment.
+        mailer = _buildBrevoMailer(process.env.BREVO_API_KEY);
+        mailerStatus.transport = `Brevo API (sending as ${EMAIL_FROM_ADDRESS || 'unset — set EMAIL_USER'})`;
+    } else if (process.env.SMTP_HOST) {
         // Generic SMTP — works with any provider (custom domain mailboxes,
         // SES, SendGrid, Mailgun, Postmark, Zoho, Outlook/Office365, etc).
         mailer = nodemailer.createTransport({
@@ -555,8 +621,6 @@ function ensureMailer() {
     if (Date.now() - _lastInitAttempt > MAILER_RETRY_COOLDOWN_MS) _initMailer();
     return !!mailer;
 }
-
-const EMAIL_FROM_ADDRESS = process.env.SMTP_USER || process.env.EMAIL_USER;
 
 async function sendMail(to, subject, html) {
     if (!ensureMailer()) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
