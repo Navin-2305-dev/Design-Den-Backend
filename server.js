@@ -1146,14 +1146,22 @@ app.post('/api/commissions/:commissionId/accept', optionalAuth, async (req,res) 
         if (!c) return res.status(404).json({ message:'Commission not found.' });
         if (!['Quoted','Accepted'].includes(c.status)) return res.status(400).json({ message:'This commission does not have an active quote to accept.' });
         if (!c.quotedPrice || c.quotedPrice <= 0) return res.status(400).json({ message:'No quoted price has been set yet.' });
-        // NEW: payment can only start once BOTH sides have approved the SAME
-        // current price — previously this only checked that a price existed
-        // at all, which meant a customer could pay an admin's opening offer
-        // without any real back-and-forth, and there was no way to actually
-        // negotiate. This is the gate that makes the dual-approval flow real
-        // rather than cosmetic.
-        if (!c.adminApproved || !c.userApproved) {
-            return res.status(400).json({ message:'Both you and Design Den need to approve the current price before payment can start.' });
+        // FIX: payment is allowed when EITHER:
+        //   (a) both sides explicitly approved the same price through the negotiation flow, OR
+        //   (b) admin set status = 'Accepted' directly (implies admin's acceptance on behalf
+        //       of both parties — the old strict dual-flag check prevented payment even when
+        //       the admin used the status dropdown to accept, confusing both parties).
+        const canPay = (c.adminApproved && c.userApproved) || c.status === 'Accepted';
+        if (!canPay) {
+            return res.status(400).json({ message:'Design Den hasn\'t finalised the price yet. Please wait for their confirmation email, then try again.' });
+        }
+        // If status is Accepted but flags weren't explicitly set (e.g. via dropdown), fix them
+        // atomically before opening payment so every subsequent check is consistent.
+        if (c.status === 'Accepted' && (!c.adminApproved || !c.userApproved)) {
+            c.adminApproved = true;
+            c.userApproved  = true;
+            c.negotiationLog.push({ by:'admin', price:c.quotedPrice, message:'Payment unlocked — accepted by admin', at: new Date() });
+            await c.save();
         }
         if (c.status !== 'Accepted') { c.status = 'Accepted'; await c.save(); }
         // Reuses the exact same Razorpay order-creation shape as /api/payment/create-order,
@@ -1302,8 +1310,18 @@ app.post('/api/commissions/:commissionId/pay/cod', optionalAuth, async (req,res)
 
         if (!['Quoted','Accepted'].includes(c.status)) return res.status(400).json({ message:'This commission does not have an active quote to pay for.' });
         if (!c.quotedPrice || c.quotedPrice <= 0) return res.status(400).json({ message:'No quoted price has been set yet.' });
-        if (!c.adminApproved || !c.userApproved) {
-            return res.status(400).json({ message:'Both you and Design Den need to approve the current price before payment can start.' });
+        // FIX: mirror the same dual-path check used in the Razorpay /accept route —
+        // payment is allowed when bothApproved OR status is 'Accepted' (admin accepted).
+        const codCanPay = (c.adminApproved && c.userApproved) || c.status === 'Accepted';
+        if (!codCanPay) {
+            return res.status(400).json({ message:'Design Den hasn\'t finalised the price yet. Please wait for their confirmation email, then try again.' });
+        }
+        // Sync approval flags if they weren't set explicitly (e.g. status set via dropdown)
+        if (c.status === 'Accepted' && (!c.adminApproved || !c.userApproved)) {
+            c.adminApproved = true;
+            c.userApproved  = true;
+            c.negotiationLog.push({ by:'admin', price:c.quotedPrice, message:'Payment unlocked (COD) — accepted by admin', at: new Date() });
+            await c.save();
         }
 
         const { address, guestEmail, guestPhone } = req.body;
@@ -2254,6 +2272,19 @@ app.put('/api/admin/commissions/:id', adminAuth, async (req,res) => {
         }
         const update = { ...req.body };
         if (update.status === 'Completed' && !prev.completedAt) update.completedAt = new Date();
+        // FIX: when admin explicitly sets status → 'Accepted' and there is already a quoted
+        // price on record, treat this as a full "both sides agreed" signal so the customer's
+        // Pay Now button unlocks immediately. Previously only the dedicated accept-direct
+        // endpoint set both flags; setting status via the dropdown left userApproved=false and
+        // the customer could never reach the payment screen even though admin clearly wanted to.
+        if (update.status === 'Accepted' && prev.quotedPrice && prev.quotedPrice > 0) {
+            update.adminApproved = true;
+            update.userApproved  = true;
+            // Log the implicit admin acceptance if it isn't already there
+            if (!prev.adminApproved || !prev.userApproved) {
+                update.$push = { negotiationLog: { by:'admin', price:prev.quotedPrice, message:'Admin marked as Accepted — payment unlocked for customer', at: new Date() } };
+            }
+        }
         const c = await Commission.findByIdAndUpdate(req.params.id, update, { new:true, runValidators:true });
         const statusChanged = prev.status !== c.status;
         const noteChanged   = req.body.adminNote !== undefined && prev.adminNote !== c.adminNote;
@@ -2289,6 +2320,31 @@ app.post('/api/admin/commissions/:id/propose', adminAuth, async (req,res) => {
         if (c.status === 'New') c.status = 'Quoted';
         await c.save();
         if (c.email) sendMail(c.email, `New Price Proposed — ${c.commissionId} 💬`, commissionNegotiationEmail(c, 'user'));
+        res.json({ commission:c });
+    } catch(e) { res.status(400).json({ message:e.message }); }
+});
+
+// NEW: "Send & Finalize" — proposes a price AND immediately marks it accepted on behalf
+// of both parties so the customer receives a single "Ready to Pay" email and the Pay Now
+// button lights up without any extra approval step. Use this when the admin is quoting a
+// final price they are already happy with and don't want a back-and-forth round trip.
+app.post('/api/admin/commissions/:id/propose-accept', adminAuth, async (req,res) => {
+    try {
+        const { price, message } = req.body;
+        const p = Number(price);
+        if (!p || p <= 0) return res.status(400).json({ message:'Enter a valid price.' });
+        const c = await Commission.findById(req.params.id);
+        if (!c) return res.status(404).json({ message:'Not found' });
+        if (c.status === 'Converted') return res.status(400).json({ message:'This commission has already been paid for and converted into an order.' });
+        c.quotedPrice    = p;
+        c.proposedBy     = 'admin';
+        c.adminApproved  = true;
+        c.userApproved   = true;   // admin finalises on behalf of both parties
+        c.status         = 'Accepted';
+        c.negotiationLog.push({ by:'admin', price:p, message: ((message||'').trim() || 'Admin finalised price — payment unlocked') });
+        await c.save();
+        // Single "ready to pay" email — no separate approval step needed from customer side.
+        if (c.email) sendMail(c.email, `Your Commission Quote is Finalised — ${c.commissionId} ✅ Ready to Pay`, commissionNegotiationEmail(c, 'user'));
         res.json({ commission:c });
     } catch(e) { res.status(400).json({ message:e.message }); }
 });
