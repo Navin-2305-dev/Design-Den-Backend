@@ -1275,6 +1275,115 @@ app.post('/api/commissions/:commissionId/pay/verify', optionalAuth, async (req,r
     } catch (err) { console.error('[POST /commissions/:id/pay/verify]', err); res.status(500).json({ message:'Payment succeeded but we could not finalize your order — please contact support with your payment ID.' }); }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  COMMISSION → ORDER: Cash on Delivery payment path
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEW: previously the only way to convert a commission into an order was through
+// Razorpay. If the admin has COD enabled in settings, commissions should also be
+// payable via COD — same setting gate already enforced for regular product orders.
+// Unlike the Razorpay path (which requires a separate /accept → /pay/verify round
+// trip), COD can be done in one shot: validate → create order → convert.
+app.post('/api/commissions/:commissionId/pay/cod', optionalAuth, async (req,res) => {
+    try {
+        // 1. Check COD is enabled — same setting and same default as regular orders
+        const codSetting = await Settings.findOne({ key:'shipping.cod' });
+        const codEnabled = !codSetting || codSetting.value === 'Yes';
+        if (!codEnabled) return res.status(400).json({ message:'Cash on Delivery is currently unavailable. Please pay online.' });
+
+        const commIdUpper = req.params.commissionId.toUpperCase();
+        const c = await Commission.findOne({ commissionId: commIdUpper });
+        if (!c) return res.status(404).json({ message:'Commission not found.' });
+
+        // Already converted? Return the linked order instead of erroring.
+        if (c.status === 'Converted' && c.linkedOrderId) {
+            const existing = await Order.findOne({ id: c.linkedOrderId });
+            return res.json({ success:true, order: existing });
+        }
+
+        if (!['Quoted','Accepted'].includes(c.status)) return res.status(400).json({ message:'This commission does not have an active quote to pay for.' });
+        if (!c.quotedPrice || c.quotedPrice <= 0) return res.status(400).json({ message:'No quoted price has been set yet.' });
+        if (!c.adminApproved || !c.userApproved) {
+            return res.status(400).json({ message:'Both you and Design Den need to approve the current price before payment can start.' });
+        }
+
+        const { address, guestEmail, guestPhone } = req.body;
+        if (!address || !address.line1 || !address.city || !address.pin) return res.status(400).json({ message:'A delivery address is required.' });
+
+        const isGuest = !req.user;
+        if (isGuest) {
+            const emailRx = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+            if (!guestEmail || !emailRx.test(String(guestEmail).trim().toLowerCase())) {
+                return res.status(400).json({ message:'A valid email is required.' });
+            }
+        }
+
+        // 2. Atomically claim the conversion slot — same race-prevention pattern as /pay/verify
+        const claimed = await Commission.findOneAndUpdate(
+            { commissionId: commIdUpper, status:{ $in:['Quoted','Accepted'] } },
+            { status:'Converting' },
+            { new:true }
+        );
+        if (!claimed) {
+            const recheck = await Commission.findOne({ commissionId: commIdUpper });
+            if (recheck && recheck.status === 'Converted' && recheck.linkedOrderId) {
+                const existing = await Order.findOne({ id: recheck.linkedOrderId });
+                return res.json({ success:true, order: existing });
+            }
+            return res.status(409).json({ message:'This commission is already being processed. Please refresh and try again.' });
+        }
+
+        const shipDaysSetting = await Settings.findOne({ key:'shipping.days' });
+        const defaultDeliveryDays = shipDaysSetting ? parseInt(shipDaysSetting.value,10) || 2 : 2;
+        const orderId = `DD-${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).substring(2,5).toUpperCase()}`;
+        const today   = new Date().toLocaleDateString('en-IN',{ day:'2-digit', month:'short', year:'numeric' });
+        const txnId   = 'COD-' + Date.now();
+
+        let order;
+        try {
+            order = await Order.create({
+                userId:        req.user ? req.user.id : null,
+                guestEmail:    isGuest ? String(guestEmail).trim().toLowerCase() : '',
+                guestPhone:    isGuest ? String(guestPhone || '').trim() : '',
+                isGuestOrder:  isGuest,
+                id:            orderId,
+                items: [{
+                    _id:          'commission-' + c.commissionId,
+                    name:         `Custom Commission — ${c.type}`,
+                    price:        c.quotedPrice,
+                    qty:          1,
+                    isCommission: true,
+                    commissionId: c.commissionId
+                }],
+                total:       c.quotedPrice,
+                shipping:    0,
+                discount:    0,
+                coupon:      null,
+                status:      'Placed',
+                date:        today,
+                address,
+                payment:     { method:'Cash on Delivery', txnId },
+                deliveryDays: defaultDeliveryDays
+            });
+        } catch (createErr) {
+            // Roll back the Converting claim so the customer can retry
+            await Commission.findOneAndUpdate(
+                { commissionId: commIdUpper, status:'Converting' },
+                { status:'Accepted' }
+            ).catch(()=>{});
+            throw createErr;
+        }
+
+        claimed.status       = 'Converted';
+        claimed.linkedOrderId = orderId;
+        await claimed.save();
+        if (req.user) await User.findByIdAndUpdate(req.user.id, { $inc:{ totalSpent:c.quotedPrice, orderCount:1 } });
+
+        // Use the same confirmation email as the Razorpay path
+        sendMail(c.email, `Commission Confirmed (COD) — Order ${orderId} 🎉`, commissionConvertedEmail(c, order));
+        res.status(201).json({ success:true, order });
+    } catch(err) { console.error('[POST /commissions/:id/pay/cod]',err); res.status(500).json({ message:'Could not place Cash on Delivery order. Please try again.' }); }
+});
+
 app.get('/api/user/commissions', auth, async (req,res) => {
     try {
         const user = await User.findById(req.user.id).select('email');
@@ -2194,6 +2303,30 @@ app.post('/api/admin/commissions/:id/approve', adminAuth, async (req,res) => {
         c.negotiationLog.push({ by:'admin', price:c.quotedPrice, message:'Approved' });
         await c.save();
         if (c.email) sendMail(c.email, `Design Den Approved Your Price — ${c.commissionId} 👍`, commissionNegotiationEmail(c, 'user'));
+        res.json({ commission:c });
+    } catch(e) { res.status(400).json({ message:e.message }); }
+});
+
+// NEW: Admin "direct accept" — marks BOTH sides as agreed so the customer
+// can pay immediately. Use this when the customer has verbally confirmed
+// (WhatsApp, phone, email outside the tracker) and you don't need the
+// online back-and-forth approve flow before unlocking payment.
+// This is the fix for the case where the admin sets the first quote and
+// is happy with it, but previously had no way to unlock payment without
+// waiting for the customer to also click "Approve" in the tracker.
+app.post('/api/admin/commissions/:id/accept-direct', adminAuth, async (req,res) => {
+    try {
+        const c = await Commission.findById(req.params.id);
+        if (!c) return res.status(404).json({ message:'Not found' });
+        if (c.status === 'Converted') return res.status(400).json({ message:'This commission has already been paid for and converted into an order.' });
+        if (!c.quotedPrice || c.quotedPrice <= 0) return res.status(400).json({ message:'Set a quoted price first before accepting on both sides.' });
+        c.adminApproved = true;
+        c.userApproved  = true;
+        if (['New','Quoted'].includes(c.status)) c.status = 'Accepted';
+        c.negotiationLog.push({ by:'admin', price:c.quotedPrice, message:'Admin accepted — quote finalised, payment enabled for customer' });
+        await c.save();
+        // Notify customer so they know they can now pay without any further approval step
+        if (c.email) sendMail(c.email, `Your Commission Quote is Finalised — ${c.commissionId} ✅ Ready to Pay`, commissionNegotiationEmail(c, 'user'));
         res.json({ commission:c });
     } catch(e) { res.status(400).json({ message:e.message }); }
 });
