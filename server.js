@@ -957,17 +957,28 @@ function patternDeliveryEmail(p, customerName, email, txnId) {
     </div>`);
 }
 
+// FIXED: this used to check the legacy `mailer` variable directly and call
+// mailer.sendMail() itself — but `mailer` is only ever set in SMTP mode
+// (see _initMailer above). Under Brevo (mailerMode === 'brevo'), `mailer`
+// stays null forever, so this always fell into the "Mailer not configured"
+// branch and failed, even though plain-text sendMail() worked fine — that
+// function was already correctly routing through _dispatchMail(), which
+// checks mailerMode instead of the raw variable. Attachment delivery was
+// simply never updated when Brevo support was added. The fix: build the
+// attachment in the same {filename, content, encoding, contentType} shape
+// sendMail's dispatcher already expects, and hand off to _dispatchMail()
+// — which already knows how to translate that into Brevo's {name, content}
+// attachment shape or pass it straight through to nodemailer for SMTP.
 async function sendPatternMail(to, subject, html, fileData, fileName) {
-    if (!mailer) { await EmailLog.create({ to, subject, status:'failed', error:'Mailer not configured (EMAIL_USER/EMAIL_PASS or SMTP_HOST missing)' }).catch(()=>{}); return; }
-    try {
-        const mailOpts = { from:`"Design Den 🧶" <${EMAIL_FROM_ADDRESS}>`, to, subject, html };
-        if (fileData && fileData.startsWith('data:')) {
-            const matches = fileData.match(/^data:([^;]+);base64,(.+)$/);
-            if (matches) {
-                mailOpts.attachments = [{ filename: fileName||'pattern.pdf', content: matches[2], encoding: 'base64', contentType: matches[1] }];
-            }
+    let attachment = null;
+    if (fileData && fileData.startsWith('data:')) {
+        const matches = fileData.match(/^data:([^;]+);base64,(.+)$/);
+        if (matches) {
+            attachment = { filename: fileName||'pattern.pdf', content: matches[2], encoding: 'base64', contentType: matches[1] };
         }
-        await mailer.sendMail(mailOpts);
+    }
+    try {
+        await _dispatchMail(to, subject, html, attachment);
         console.log(`📧 Pattern email sent to ${to}`);
         await EmailLog.create({ to, subject, status:'sent' }).catch(()=>{});
     } catch(err) {
