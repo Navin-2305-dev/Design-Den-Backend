@@ -220,7 +220,7 @@ const productSchema = new mongoose.Schema({
     name:          { type:String, required:true, trim:true },
     price:         { type:Number, required:true, min:0 }, // base/display price — see variants note above
     originalPrice: { type:Number, default:null },
-    category:      { type:String, required:true, enum:['yarn','kit','hook','Toy','Accessories','Keychains','flower'] },
+    category:      { type:String, required:true, enum:['yarn','kit','hook','Toy','Accessories','Keychains','flower','Daily Accessories'] },
     stock:         { type:Number, required:true, default:0, min:0 }, // ignored once variants exist — see note above
     rating:        { type:Number, default:4.8, min:1, max:5 },
     reviewCount:   { type:Number, default:0 },
